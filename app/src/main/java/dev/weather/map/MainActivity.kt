@@ -729,6 +729,8 @@ private fun renderTemperatureBitmap(snapshot: ForecastSnapshot): Bitmap {
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     val northWest = project(snapshot.bounds.north, snapshot.bounds.west, 0.0)
     val southEast = project(snapshot.bounds.south, snapshot.bounds.east, 0.0)
+    val minTemp = snapshot.points.minOfOrNull { it.temperature } ?: snapshot.current.temperature
+    val maxTemp = snapshot.points.maxOfOrNull { it.temperature } ?: snapshot.current.temperature
     val cell = 3
     var y = 0
     while (y < height) {
@@ -737,7 +739,7 @@ private fun renderTemperatureBitmap(snapshot: ForecastSnapshot): Bitmap {
             val sampleX = northWest.first + (southEast.first - northWest.first) * ((x + cell / 2.0) / width)
             val sampleY = northWest.second + (southEast.second - northWest.second) * ((y + cell / 2.0) / height)
             val geo = unproject(sampleX, sampleY, 0.0)
-            paint.color = tempColor(temperatureAt(geo.first, geo.second, snapshot))
+            paint.color = tempColor(temperatureAt(geo.first, geo.second, snapshot), minTemp, maxTemp)
             canvas.drawRect(
                 x.toFloat(),
                 y.toFloat(),
@@ -987,15 +989,15 @@ private const val FORECAST_CACHE_TTL_MS = 10 * 60 * 1_000L
 private const val FORECAST_CACHE_LIMIT = 24
 
 private fun qualityForZoom(zoom: Double): RenderQuality = when {
-    zoom <= 7.0 -> RenderQuality(4, 4)
+    zoom <= 7.0 -> RenderQuality(6, 5)
     zoom <= 10.0 -> RenderQuality(5, 5)
     zoom <= 13.0 -> RenderQuality(6, 6)
     else -> RenderQuality(5, 5)
 }
 
 private fun labelPolicyForZoom(zoom: Double): TempLabelPolicy = when {
-    zoom <= 7.0 -> TempLabelPolicy(0, maxLabels = 4, minLabels = 2, minDistancePx = 220.0, panHysteresisPx = 170.0)
-    zoom <= 10.0 -> TempLabelPolicy(1, maxLabels = 6, minLabels = 4, minDistancePx = 185.0, panHysteresisPx = 145.0)
+    zoom <= 7.0 -> TempLabelPolicy(0, maxLabels = 6, minLabels = 5, minDistancePx = 155.0, panHysteresisPx = 170.0)
+    zoom <= 10.0 -> TempLabelPolicy(1, maxLabels = 7, minLabels = 5, minDistancePx = 165.0, panHysteresisPx = 145.0)
     zoom <= 13.0 -> TempLabelPolicy(2, maxLabels = 8, minLabels = 5, minDistancePx = 155.0, panHysteresisPx = 120.0)
     else -> TempLabelPolicy(3, maxLabels = 5, minLabels = 3, minDistancePx = 190.0, panHysteresisPx = 130.0)
 }
@@ -1053,13 +1055,20 @@ private fun buildGrid(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon:
     return points
 }
 
-private fun tempColor(temp: Double): Int {
-    val lower = TEMP_COLOR_STOPS.lastOrNull { temp >= it.temp } ?: TEMP_COLOR_STOPS.first()
-    val upper = TEMP_COLOR_STOPS.firstOrNull { temp <= it.temp } ?: TEMP_COLOR_STOPS.last()
+private fun tempColor(temp: Double, minTemp: Double, maxTemp: Double): Int {
+    val actualSpan = max(0.1, maxTemp - minTemp)
+    val center = (minTemp + maxTemp) / 2.0
+    val adjustedTemp = if (actualSpan < MIN_VISIBLE_TEMP_SPAN_C) {
+        center + (temp - center) * (MIN_VISIBLE_TEMP_SPAN_C / actualSpan)
+    } else {
+        temp
+    }
+    val lower = TEMP_COLOR_STOPS.lastOrNull { adjustedTemp >= it.temp } ?: TEMP_COLOR_STOPS.first()
+    val upper = TEMP_COLOR_STOPS.firstOrNull { adjustedTemp <= it.temp } ?: TEMP_COLOR_STOPS.last()
     if (lower.temp == upper.temp) return AndroidColor.argb(138, lower.red, lower.green, lower.blue)
-    val t = ((temp - lower.temp) / (upper.temp - lower.temp)).coerceIn(0.0, 1.0)
+    val t = ((adjustedTemp - lower.temp) / (upper.temp - lower.temp)).coerceIn(0.0, 1.0)
     return AndroidColor.argb(
-        138,
+        TEMP_PIXEL_ALPHA,
         lerpColorChannel(lower.red, upper.red, t),
         lerpColorChannel(lower.green, upper.green, t),
         lerpColorChannel(lower.blue, upper.blue, t),
@@ -1091,13 +1100,13 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     previousLabels.forEach {
         addCandidate(it.latitude, it.longitude, 1, scoreBoost = 8.0)
     }
+    labelAnchorFractions(policy).forEachIndexed { index, anchor ->
+        val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
+        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08)
+    }
     snapshot.points.forEachIndexed { index, point ->
         if (index == 0) return@forEachIndexed
         addCandidate(point.latitude, point.longitude, 2, scoreBoost = 2.5)
-    }
-    labelAnchorFractions(policy).forEachIndexed { index, anchor ->
-        val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
-        addCandidate(point.first, point.second, 3 + index, scoreBoost = 1.0)
     }
 
     fun pick(distance: Double): List<LabelCandidate> {
@@ -1121,14 +1130,16 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         return chosen
     }
 
-    val selected = pick(policy.minDistancePx).let {
-        if (it.size < policy.minLabels) pick(policy.minDistancePx * 0.76) else it
-    }
+    val selected = listOf(1.0, 0.82, 0.68, 0.56)
+        .asSequence()
+        .map { pick(policy.minDistancePx * it) }
+        .firstOrNull { it.size >= policy.minLabels }
+        ?: pick(policy.minDistancePx * 0.48)
     return selected.map { TempLabel(it.latitude, it.longitude, it.temperature.roundToInt()) }
 }
 
 private fun labelAnchorFractions(policy: TempLabelPolicy): List<Pair<Double, Double>> = when (policy.zoomBand) {
-    0 -> listOf(0.36 to 0.40, 0.64 to 0.58, 0.50 to 0.30, 0.48 to 0.70)
+    0 -> listOf(0.30 to 0.34, 0.70 to 0.34, 0.34 to 0.56, 0.66 to 0.56, 0.40 to 0.76, 0.76 to 0.74)
     1 -> listOf(0.28 to 0.36, 0.62 to 0.32, 0.40 to 0.58, 0.74 to 0.62, 0.52 to 0.44, 0.25 to 0.68)
     2 -> listOf(0.26 to 0.34, 0.55 to 0.30, 0.76 to 0.44, 0.35 to 0.56, 0.62 to 0.62, 0.22 to 0.72, 0.82 to 0.72, 0.48 to 0.46)
     else -> listOf(0.36 to 0.38, 0.66 to 0.42, 0.50 to 0.58, 0.30 to 0.68, 0.72 to 0.70)
@@ -1329,7 +1340,9 @@ private const val RADAR_SOURCE = "radar-source"
 private const val RADAR_LAYER = "radar-layer"
 private const val TEMP_SOURCE = "temperature-source"
 private const val TEMP_LAYER = "temperature-layer"
-private const val TEMP_LAYER_OPACITY = 0.34f
+private const val TEMP_LAYER_OPACITY = 0.46f
+private const val TEMP_PIXEL_ALPHA = 155
+private const val MIN_VISIBLE_TEMP_SPAN_C = 6.0
 
 private val TEMP_COLOR_STOPS = listOf(
     TempColorStop(-8.0, 37, 99, 235),
