@@ -55,6 +55,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -113,6 +114,7 @@ private data class CameraState(
     val zoom: Double,
     val width: Int,
     val height: Int,
+    val bounds: GeoBounds? = null,
 )
 
 private data class GeoBounds(
@@ -251,6 +253,10 @@ private fun WeatherMapApp(
     var radarIndex by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf("Lade Wetterdaten...") }
     var loadToken by remember { mutableIntStateOf(0) }
+    var mapOverlayTransform by remember { mutableStateOf<OverlayTransform?>(null) }
+    val overlayBounds = remember(renderCamera) {
+        if (renderCamera.width >= 32 && renderCamera.height >= 32) cameraBounds(renderCamera) else null
+    }
 
     LaunchedEffect(renderCamera.latitude, renderCamera.longitude, renderCamera.zoom, selectedHour) {
         if (renderCamera.width < 32 || renderCamera.height < 32) return@LaunchedEffect
@@ -297,17 +303,22 @@ private fun WeatherMapApp(
                     recenterNonce = recenterNonce,
                     layer = layer,
                     radarFrame = radarFrames.getOrNull(radarIndex),
+                    overlayBounds = overlayBounds,
+                    overlayWidth = renderCamera.width,
+                    overlayHeight = renderCamera.height,
                     onCameraMove = { liveCamera = it },
                     onCameraIdle = {
                         liveCamera = it
                         renderCamera = it
                     },
+                    onOverlayTransform = { mapOverlayTransform = it },
                 )
 
                 TemperatureOverlay(
                     state = forecastState,
                     renderCamera = renderCamera,
                     liveCamera = liveCamera,
+                    mapTransform = mapOverlayTransform,
                     active = layer == WeatherLayer.Temp,
                 )
 
@@ -363,8 +374,12 @@ private fun NativeWeatherMap(
     recenterNonce: Int,
     layer: WeatherLayer,
     radarFrame: RadarFrame?,
+    overlayBounds: GeoBounds?,
+    overlayWidth: Int,
+    overlayHeight: Int,
     onCameraMove: (CameraState) -> Unit,
     onCameraIdle: (CameraState) -> Unit,
+    onOverlayTransform: (OverlayTransform?) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -372,6 +387,19 @@ private fun NativeWeatherMap(
     var mapViewForLifecycle by remember { mutableStateOf<MapView?>(null) }
     var handledRecenterNonce by remember { mutableIntStateOf(0) }
     var lastMoveEmitMs by remember { mutableStateOf(0L) }
+    val currentOverlayBounds by rememberUpdatedState(overlayBounds)
+    val currentOverlayWidth by rememberUpdatedState(overlayWidth)
+    val currentOverlayHeight by rememberUpdatedState(overlayHeight)
+    val currentOnOverlayTransform by rememberUpdatedState(onOverlayTransform)
+
+    fun emitOverlayTransform(map: MapLibreMap, width: Int, height: Int) {
+        val bounds = currentOverlayBounds
+        if (bounds == null || width < 1 || height < 1) {
+            currentOnOverlayTransform(null)
+            return
+        }
+        currentOnOverlayTransform(map.overlayTransformFor(bounds, width, height))
+    }
 
     AndroidView(
         modifier = Modifier.fillMaxSize(),
@@ -405,21 +433,25 @@ private fun NativeWeatherMap(
                         if (now - lastMoveEmitMs >= 90L) {
                             lastMoveEmitMs = now
                             onCameraMove(map.cameraState(width, height))
+                            emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
                         }
                     }
                     map.addOnCameraIdleListener {
                         onCameraIdle(map.cameraState(width, height))
+                        emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
                     }
                     post {
                         val initial = map.cameraState(width, height)
                         onCameraMove(initial)
                         onCameraIdle(initial)
+                        emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
                     }
                 }
             }
         },
         update = { mapView ->
             mapHolder.updateRadar(radarFrame, layer)
+            mapHolder.map?.let { emitOverlayTransform(it, currentOverlayWidth, currentOverlayHeight) }
             if (recenterNonce > 0 && recenterNonce != handledRecenterNonce) {
                 handledRecenterNonce = recenterNonce
                 mapHolder.map?.animateCamera(
@@ -609,7 +641,13 @@ private fun TemperatureLabel(label: TempLabel, x: Double, y: Double) {
 }
 
 @Composable
-private fun TemperatureOverlay(state: ForecastUiState, renderCamera: CameraState, liveCamera: CameraState, active: Boolean) {
+private fun TemperatureOverlay(
+    state: ForecastUiState,
+    renderCamera: CameraState,
+    liveCamera: CameraState,
+    mapTransform: OverlayTransform?,
+    active: Boolean,
+) {
     if (!active || liveCamera.width < 32 || liveCamera.height < 32) return
     val snapshot = state.snapshot
     if (snapshot == null) {
@@ -624,7 +662,7 @@ private fun TemperatureOverlay(state: ForecastUiState, renderCamera: CameraState
     val bitmap = remember(snapshot, renderCamera) {
         renderTemperatureBitmap(snapshot, renderCamera).asImageBitmap()
     }
-    val transform = overlayTransform(renderCamera, liveCamera)
+    val transform = mapTransform ?: overlayTransform(renderCamera, liveCamera)
     val density = LocalDensity.current
     val widthDp = with(density) { renderCamera.width.toDp() }
     val heightDp = with(density) { renderCamera.height.toDp() }
@@ -636,8 +674,8 @@ private fun TemperatureOverlay(state: ForecastUiState, renderCamera: CameraState
             .graphicsLayer {
                 translationX = transform.offsetX
                 translationY = transform.offsetY
-                scaleX = transform.scale
-                scaleY = transform.scale
+                scaleX = transform.scaleX
+                scaleY = transform.scaleY
                 transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
             }
     )
@@ -671,7 +709,26 @@ private fun renderTemperatureBitmap(snapshot: ForecastSnapshot, camera: CameraSt
     return bitmap
 }
 
-private data class OverlayTransform(val offsetX: Float, val offsetY: Float, val scale: Float)
+private data class OverlayTransform(
+    val offsetX: Float,
+    val offsetY: Float,
+    val scaleX: Float,
+    val scaleY: Float,
+)
+
+private fun MapLibreMap.overlayTransformFor(bounds: GeoBounds, bitmapWidth: Int, bitmapHeight: Int): OverlayTransform {
+    val northwest = projection.toScreenLocation(LatLng(bounds.north, bounds.west))
+    val northeast = projection.toScreenLocation(LatLng(bounds.north, bounds.east))
+    val southwest = projection.toScreenLocation(LatLng(bounds.south, bounds.west))
+    val scaleX = (northeast.x - northwest.x) / bitmapWidth.toFloat()
+    val scaleY = (southwest.y - northwest.y) / bitmapHeight.toFloat()
+    return OverlayTransform(
+        offsetX = northwest.x,
+        offsetY = northwest.y,
+        scaleX = scaleX,
+        scaleY = scaleY,
+    )
+}
 
 private fun overlayTransform(renderCamera: CameraState, liveCamera: CameraState): OverlayTransform {
     val scale = 2.0.pow(liveCamera.zoom - renderCamera.zoom)
@@ -681,7 +738,7 @@ private fun overlayTransform(renderCamera: CameraState, liveCamera: CameraState)
         (renderCenterAtRenderZoom.first - liveCenterAtRenderZoom.first) * scale)
     val offsetY = ((liveCamera.height - renderCamera.height * scale) / 2.0 +
         (renderCenterAtRenderZoom.second - liveCenterAtRenderZoom.second) * scale)
-    return OverlayTransform(offsetX.toFloat(), offsetY.toFloat(), scale.toFloat())
+    return OverlayTransform(offsetX.toFloat(), offsetY.toFloat(), scale.toFloat(), scale.toFloat())
 }
 
 @Composable
@@ -1006,10 +1063,24 @@ private data class LabelCandidate(
 
 private fun MapLibreMap.cameraState(width: Int, height: Int): CameraState {
     val target = cameraPosition.target ?: LatLng(50.7753, 6.0839)
-    return CameraState(target.latitude, target.longitude, cameraPosition.zoom, max(1, width), max(1, height))
+    val visibleBounds = projection.visibleRegion.latLngBounds
+    return CameraState(
+        latitude = target.latitude,
+        longitude = target.longitude,
+        zoom = cameraPosition.zoom,
+        width = max(1, width),
+        height = max(1, height),
+        bounds = GeoBounds(
+            north = visibleBounds.getLatNorth(),
+            south = visibleBounds.getLatSouth(),
+            west = visibleBounds.getLonWest(),
+            east = visibleBounds.getLonEast(),
+        ),
+    )
 }
 
 private fun cameraBounds(camera: CameraState): GeoBounds {
+    camera.bounds?.let { return it }
     val center = project(camera.latitude, camera.longitude, camera.zoom)
     val nw = unproject(center.first - camera.width / 2.0, center.second - camera.height / 2.0, camera.zoom)
     val se = unproject(center.first + camera.width / 2.0, center.second + camera.height / 2.0, camera.zoom)
