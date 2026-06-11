@@ -20,7 +20,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -61,8 +60,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -76,6 +73,7 @@ import androidx.lifecycle.LifecycleOwner
 import org.json.JSONArray
 import org.json.JSONObject
 import org.maplibre.android.MapLibre
+import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
@@ -84,6 +82,7 @@ import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
 import org.maplibre.android.style.layers.RasterLayer
+import org.maplibre.android.style.sources.ImageSource
 import org.maplibre.android.style.sources.RasterSource
 import org.maplibre.android.style.sources.TileSet
 import java.net.HttpURLConnection
@@ -142,6 +141,8 @@ private data class ProjectedWeatherPoint(
 )
 
 private data class TempLabel(val latitude: Double, val longitude: Double, val value: Int)
+
+private data class ProjectedTempLabel(val label: TempLabel, val x: Double, val y: Double)
 
 private data class ForecastSnapshot(
     val bounds: GeoBounds,
@@ -265,9 +266,9 @@ private fun WeatherMapApp(
     var radarIndex by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf("Lade Wetterdaten...") }
     var loadToken by remember { mutableIntStateOf(0) }
-    var mapOverlayTransform by remember { mutableStateOf<OverlayTransform?>(null) }
-    val overlayBounds = remember(renderCamera) {
-        if (renderCamera.width >= 32 && renderCamera.height >= 32) cameraBounds(renderCamera) else null
+    var projectedTempLabels by remember { mutableStateOf<List<ProjectedTempLabel>>(emptyList()) }
+    val tempLabels = remember(forecastState.snapshot, liveCamera, layer) {
+        if (layer == WeatherLayer.Temp) visibleTemperatureLabels(forecastState.snapshot, liveCamera) else emptyList()
     }
 
     LaunchedEffect(renderCamera.latitude, renderCamera.longitude, renderCamera.zoom, selectedHour) {
@@ -320,29 +321,28 @@ private fun WeatherMapApp(
                     recenterNonce = recenterNonce,
                     layer = layer,
                     radarFrame = radarFrames.getOrNull(radarIndex),
-                    overlayBounds = overlayBounds,
-                    overlayWidth = renderCamera.width,
-                    overlayHeight = renderCamera.height,
+                    forecastSnapshot = forecastState.snapshot,
+                    tempLabels = tempLabels,
                     onCameraMove = { liveCamera = it },
                     onCameraIdle = {
                         liveCamera = it
                         renderCamera = it
                     },
-                    onOverlayTransform = { mapOverlayTransform = it },
+                    onProjectedTempLabels = { projectedTempLabels = it },
                 )
 
-                TemperatureOverlay(
-                    state = forecastState,
-                    renderCamera = renderCamera,
-                    liveCamera = liveCamera,
-                    mapTransform = mapOverlayTransform,
-                    active = layer == WeatherLayer.Temp,
-                )
+                if (layer == WeatherLayer.Temp && forecastState.snapshot == null) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawRect(
+                            color = if (forecastState.error == null) Color(0x2214B8A6) else Color(0x22EF4444),
+                            size = size,
+                        )
+                    }
+                }
 
-                if (layer == WeatherLayer.Temp) visibleTemperatureLabels(forecastState.snapshot, liveCamera).forEach { label ->
-                    val screen = screenPoint(label.latitude, label.longitude, liveCamera)
-                    if (screen.first in -80.0..(liveCamera.width + 80.0) && screen.second in -80.0..(liveCamera.height + 80.0)) {
-                        TemperatureLabel(label, screen.first, screen.second)
+                if (layer == WeatherLayer.Temp) projectedTempLabels.forEach { projected ->
+                    if (projected.x in -80.0..(liveCamera.width + 80.0) && projected.y in -80.0..(liveCamera.height + 80.0)) {
+                        TemperatureLabel(projected.label, projected.x, projected.y)
                     }
                 }
 
@@ -391,12 +391,11 @@ private fun NativeWeatherMap(
     recenterNonce: Int,
     layer: WeatherLayer,
     radarFrame: RadarFrame?,
-    overlayBounds: GeoBounds?,
-    overlayWidth: Int,
-    overlayHeight: Int,
+    forecastSnapshot: ForecastSnapshot?,
+    tempLabels: List<TempLabel>,
     onCameraMove: (CameraState) -> Unit,
     onCameraIdle: (CameraState) -> Unit,
-    onOverlayTransform: (OverlayTransform?) -> Unit,
+    onProjectedTempLabels: (List<ProjectedTempLabel>) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -404,18 +403,16 @@ private fun NativeWeatherMap(
     var mapViewForLifecycle by remember { mutableStateOf<MapView?>(null) }
     var handledRecenterNonce by remember { mutableIntStateOf(0) }
     var lastMoveEmitMs by remember { mutableStateOf(0L) }
-    val currentOverlayBounds by rememberUpdatedState(overlayBounds)
-    val currentOverlayWidth by rememberUpdatedState(overlayWidth)
-    val currentOverlayHeight by rememberUpdatedState(overlayHeight)
-    val currentOnOverlayTransform by rememberUpdatedState(onOverlayTransform)
+    val currentTempLabels by rememberUpdatedState(tempLabels)
+    val currentOnProjectedTempLabels by rememberUpdatedState(onProjectedTempLabels)
 
-    fun emitOverlayTransform(map: MapLibreMap, width: Int, height: Int) {
-        val bounds = currentOverlayBounds
-        if (bounds == null || width < 1 || height < 1) {
-            currentOnOverlayTransform(null)
-            return
-        }
-        currentOnOverlayTransform(map.overlayTransformFor(bounds, width, height))
+    fun emitProjectedLabels(map: MapLibreMap) {
+        currentOnProjectedTempLabels(
+            currentTempLabels.map { label ->
+                val screen = map.projection.toScreenLocation(LatLng(label.latitude, label.longitude))
+                ProjectedTempLabel(label, screen.x.toDouble(), screen.y.toDouble())
+            }
+        )
     }
 
     AndroidView(
@@ -444,31 +441,33 @@ private fun NativeWeatherMap(
                         mapHolder.style = style
                         mapHolder.installWeatherLayers()
                         mapHolder.updateRadar(radarFrame, layer)
+                        mapHolder.updateTemperature(forecastSnapshot, layer)
                     }
                     map.addOnCameraMoveListener {
                         val now = SystemClock.uptimeMillis()
+                        emitProjectedLabels(map)
                         if (now - lastMoveEmitMs >= 90L) {
                             lastMoveEmitMs = now
                             onCameraMove(map.cameraState(width, height))
-                            emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
                         }
                     }
                     map.addOnCameraIdleListener {
                         onCameraIdle(map.cameraState(width, height))
-                        emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
+                        emitProjectedLabels(map)
                     }
                     post {
                         val initial = map.cameraState(width, height)
                         onCameraMove(initial)
                         onCameraIdle(initial)
-                        emitOverlayTransform(map, currentOverlayWidth, currentOverlayHeight)
+                        emitProjectedLabels(map)
                     }
                 }
             }
         },
         update = { mapView ->
             mapHolder.updateRadar(radarFrame, layer)
-            mapHolder.map?.let { emitOverlayTransform(it, currentOverlayWidth, currentOverlayHeight) }
+            mapHolder.updateTemperature(forecastSnapshot, layer)
+            mapHolder.map?.let { emitProjectedLabels(it) }
             if (recenterNonce > 0 && recenterNonce != handledRecenterNonce) {
                 handledRecenterNonce = recenterNonce
                 mapHolder.map?.animateCamera(
@@ -502,10 +501,12 @@ private class MapHolder {
     var map: MapLibreMap? = null
     var style: Style? = null
     private var radarSource: RasterSource? = null
+    private var tempSource: ImageSource? = null
     private var lastRadarPath: String? = null
+    private var lastTempSnapshot: ForecastSnapshot? = null
 
     fun installWeatherLayers() {
-        // Temperature is rendered by Compose; MapLibre only hosts base map and radar tiles.
+        // Weather layers are installed lazily once data is available.
     }
 
     fun updateRadar(frame: RadarFrame?, layer: WeatherLayer) {
@@ -532,6 +533,36 @@ private class MapHolder {
                 rasterOpacity(if (layer == WeatherLayer.Radar) 0.62f else 0.0f)
             )
         }
+    }
+
+    fun updateTemperature(snapshot: ForecastSnapshot?, layer: WeatherLayer) {
+        val style = style ?: return
+        if (snapshot == null) {
+            style.getLayer(TEMP_LAYER)?.setProperties(rasterOpacity(0.0f))
+            return
+        }
+        if (snapshot !== lastTempSnapshot || style.getSource(TEMP_SOURCE) == null) {
+            val quad = snapshot.bounds.toLatLngQuad()
+            val bitmap = renderTemperatureBitmap(snapshot)
+            val existing = style.getSource(TEMP_SOURCE) as? ImageSource
+            if (existing == null) {
+                tempSource = ImageSource(TEMP_SOURCE, quad, bitmap)
+                style.addSource(tempSource!!)
+                style.addLayer(
+                    RasterLayer(TEMP_LAYER, TEMP_SOURCE).withProperties(
+                        rasterOpacity(if (layer == WeatherLayer.Temp) 0.36f else 0.0f)
+                    )
+                )
+            } else {
+                tempSource = existing
+                existing.setCoordinates(quad)
+                existing.setImage(bitmap)
+            }
+            lastTempSnapshot = snapshot
+        }
+        style.getLayer(TEMP_LAYER)?.setProperties(
+            rasterOpacity(if (layer == WeatherLayer.Temp) 0.36f else 0.0f)
+        )
     }
 }
 
@@ -657,60 +688,22 @@ private fun TemperatureLabel(label: TempLabel, x: Double, y: Double) {
     }
 }
 
-@Composable
-private fun TemperatureOverlay(
-    state: ForecastUiState,
-    renderCamera: CameraState,
-    liveCamera: CameraState,
-    mapTransform: OverlayTransform?,
-    active: Boolean,
-) {
-    if (!active || liveCamera.width < 32 || liveCamera.height < 32) return
-    val snapshot = state.snapshot
-    if (snapshot == null) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            drawRect(
-                color = if (state.error == null) Color(0x2214B8A6) else Color(0x22EF4444),
-                size = size,
-            )
-        }
-        return
-    }
-    val bitmap = remember(snapshot, renderCamera) {
-        renderTemperatureBitmap(snapshot, renderCamera).asImageBitmap()
-    }
-    val transform = mapTransform ?: overlayTransform(renderCamera, liveCamera)
-    val density = LocalDensity.current
-    val widthDp = with(density) { renderCamera.width.toDp() }
-    val heightDp = with(density) { renderCamera.height.toDp() }
-    Image(
-        bitmap = bitmap,
-        contentDescription = null,
-        modifier = Modifier
-            .size(widthDp, heightDp)
-            .graphicsLayer {
-                translationX = transform.offsetX
-                translationY = transform.offsetY
-                scaleX = transform.scaleX
-                scaleY = transform.scaleY
-                transformOrigin = androidx.compose.ui.graphics.TransformOrigin(0f, 0f)
-            }
-    )
-}
-
-private fun renderTemperatureBitmap(snapshot: ForecastSnapshot, camera: CameraState): Bitmap {
-    val width = max(1, camera.width)
-    val height = max(1, camera.height)
+private fun renderTemperatureBitmap(snapshot: ForecastSnapshot): Bitmap {
+    val width = 384
+    val height = 384
     val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
     val canvas = AndroidCanvas(bitmap)
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-    val quality = qualityForZoom(camera.zoom)
-    val cell = quality.overlayCellPx.roundToInt().coerceAtLeast(1)
+    val northWest = project(snapshot.bounds.north, snapshot.bounds.west, 0.0)
+    val southEast = project(snapshot.bounds.south, snapshot.bounds.east, 0.0)
+    val cell = 4
     var y = 0
     while (y < height) {
         var x = 0
         while (x < width) {
-            val geo = screenToLatLon((x + cell / 2).toFloat(), (y + cell / 2).toFloat(), camera)
+            val sampleX = northWest.first + (southEast.first - northWest.first) * ((x + cell / 2.0) / width)
+            val sampleY = northWest.second + (southEast.second - northWest.second) * ((y + cell / 2.0) / height)
+            val geo = unproject(sampleX, sampleY, 0.0)
             paint.color = tempColor(temperatureAt(geo.first, geo.second, snapshot))
             canvas.drawRect(
                 x.toFloat(),
@@ -724,38 +717,6 @@ private fun renderTemperatureBitmap(snapshot: ForecastSnapshot, camera: CameraSt
         y += cell
     }
     return bitmap
-}
-
-private data class OverlayTransform(
-    val offsetX: Float,
-    val offsetY: Float,
-    val scaleX: Float,
-    val scaleY: Float,
-)
-
-private fun MapLibreMap.overlayTransformFor(bounds: GeoBounds, bitmapWidth: Int, bitmapHeight: Int): OverlayTransform {
-    val northwest = projection.toScreenLocation(LatLng(bounds.north, bounds.west))
-    val northeast = projection.toScreenLocation(LatLng(bounds.north, bounds.east))
-    val southwest = projection.toScreenLocation(LatLng(bounds.south, bounds.west))
-    val scaleX = (northeast.x - northwest.x) / bitmapWidth.toFloat()
-    val scaleY = (southwest.y - northwest.y) / bitmapHeight.toFloat()
-    return OverlayTransform(
-        offsetX = northwest.x,
-        offsetY = northwest.y,
-        scaleX = scaleX,
-        scaleY = scaleY,
-    )
-}
-
-private fun overlayTransform(renderCamera: CameraState, liveCamera: CameraState): OverlayTransform {
-    val scale = 2.0.pow(liveCamera.zoom - renderCamera.zoom)
-    val renderCenterAtRenderZoom = project(renderCamera.latitude, renderCamera.longitude, renderCamera.zoom)
-    val liveCenterAtRenderZoom = project(liveCamera.latitude, liveCamera.longitude, renderCamera.zoom)
-    val offsetX = ((liveCamera.width - renderCamera.width * scale) / 2.0 +
-        (renderCenterAtRenderZoom.first - liveCenterAtRenderZoom.first) * scale)
-    val offsetY = ((liveCamera.height - renderCamera.height * scale) / 2.0 +
-        (renderCenterAtRenderZoom.second - liveCenterAtRenderZoom.second) * scale)
-    return OverlayTransform(offsetX.toFloat(), offsetY.toFloat(), scale.toFloat(), scale.toFloat())
 }
 
 @Composable
@@ -1204,19 +1165,18 @@ private fun GeoBounds.contains(latitude: Double, longitude: Double): Boolean =
         longitude >= west &&
         longitude <= east
 
+private fun GeoBounds.toLatLngQuad(): LatLngQuad =
+    LatLngQuad(
+        LatLng(north, west),
+        LatLng(north, east),
+        LatLng(south, east),
+        LatLng(south, west),
+    )
+
 private fun screenPoint(latitude: Double, longitude: Double, camera: CameraState): Pair<Double, Double> {
     val p = project(latitude, longitude, camera.zoom)
     val center = project(camera.latitude, camera.longitude, camera.zoom)
     return (p.first - center.first + camera.width / 2.0) to (p.second - center.second + camera.height / 2.0)
-}
-
-private fun screenToLatLon(x: Float, y: Float, camera: CameraState): Pair<Double, Double> {
-    val center = project(camera.latitude, camera.longitude, camera.zoom)
-    return unproject(
-        center.first + x - camera.width / 2.0,
-        center.second + y - camera.height / 2.0,
-        camera.zoom,
-    )
 }
 
 private fun project(latitude: Double, longitude: Double, zoom: Double): Pair<Double, Double> {
@@ -1286,3 +1246,5 @@ private object MapController {
 
 private const val RADAR_SOURCE = "radar-source"
 private const val RADAR_LAYER = "radar-layer"
+private const val TEMP_SOURCE = "temperature-source"
+private const val TEMP_LAYER = "temperature-layer"
