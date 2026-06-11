@@ -73,15 +73,16 @@ import androidx.lifecycle.LifecycleOwner
 import org.json.JSONArray
 import org.json.JSONObject
 import org.maplibre.android.MapLibre
-import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
 import org.maplibre.android.style.layers.RasterLayer
+import org.maplibre.android.style.layers.SymbolLayer
 import org.maplibre.android.style.sources.ImageSource
 import org.maplibre.android.style.sources.RasterSource
 import org.maplibre.android.style.sources.TileSet
@@ -94,6 +95,7 @@ import java.util.Locale
 import java.util.concurrent.Executors
 import kotlinx.coroutines.delay
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan
 import kotlin.math.ceil
 import kotlin.math.exp
@@ -143,6 +145,16 @@ private data class ProjectedWeatherPoint(
 private data class TempLabel(val latitude: Double, val longitude: Double, val value: Int)
 
 private data class ProjectedTempLabel(val label: TempLabel, val x: Double, val y: Double)
+
+private data class TempLabelPolicy(
+    val zoomBand: Int,
+    val maxLabels: Int,
+    val minLabels: Int,
+    val minDistancePx: Double,
+    val panHysteresisPx: Double,
+)
+
+private data class TempColorStop(val temp: Double, val red: Int, val green: Int, val blue: Int)
 
 private data class ForecastSnapshot(
     val bounds: GeoBounds,
@@ -267,8 +279,25 @@ private fun WeatherMapApp(
     var status by remember { mutableStateOf("Lade Wetterdaten...") }
     var loadToken by remember { mutableIntStateOf(0) }
     var projectedTempLabels by remember { mutableStateOf<List<ProjectedTempLabel>>(emptyList()) }
-    val tempLabels = remember(forecastState.snapshot, liveCamera, layer) {
-        if (layer == WeatherLayer.Temp) visibleTemperatureLabels(forecastState.snapshot, liveCamera) else emptyList()
+    var stableTempLabels by remember { mutableStateOf<List<TempLabel>>(emptyList()) }
+    var stableLabelCamera by remember { mutableStateOf<CameraState?>(null) }
+    var stableLabelSnapshot by remember { mutableStateOf<ForecastSnapshot?>(null) }
+    val labelPolicy = labelPolicyForZoom(liveCamera.zoom)
+
+    LaunchedEffect(forecastState.snapshot, liveCamera.latitude, liveCamera.longitude, liveCamera.zoom, layer) {
+        val snapshot = forecastState.snapshot
+        if (layer != WeatherLayer.Temp || snapshot == null || liveCamera.width < 32 || liveCamera.height < 32) {
+            stableTempLabels = emptyList()
+            stableLabelCamera = null
+            stableLabelSnapshot = null
+            return@LaunchedEffect
+        }
+        val lastCamera = stableLabelCamera
+        if (stableLabelSnapshot !== snapshot || stableTempLabels.isEmpty() || shouldRefreshTempLabels(lastCamera, liveCamera, labelPolicy)) {
+            stableTempLabels = visibleTemperatureLabels(snapshot, liveCamera, stableTempLabels)
+            stableLabelCamera = liveCamera
+            stableLabelSnapshot = snapshot
+        }
     }
 
     LaunchedEffect(renderCamera.latitude, renderCamera.longitude, renderCamera.zoom, selectedHour) {
@@ -322,7 +351,7 @@ private fun WeatherMapApp(
                     layer = layer,
                     radarFrame = radarFrames.getOrNull(radarIndex),
                     forecastSnapshot = forecastState.snapshot,
-                    tempLabels = tempLabels,
+                    tempLabels = stableTempLabels,
                     onCameraMove = { liveCamera = it },
                     onCameraIdle = {
                         liveCamera = it
@@ -548,11 +577,15 @@ private class MapHolder {
             if (existing == null) {
                 tempSource = ImageSource(TEMP_SOURCE, quad, bitmap)
                 style.addSource(tempSource!!)
-                style.addLayer(
-                    RasterLayer(TEMP_LAYER, TEMP_SOURCE).withProperties(
-                        rasterOpacity(if (layer == WeatherLayer.Temp) 0.36f else 0.0f)
-                    )
+                val tempLayer = RasterLayer(TEMP_LAYER, TEMP_SOURCE).withProperties(
+                    rasterOpacity(if (layer == WeatherLayer.Temp) TEMP_LAYER_OPACITY else 0.0f)
                 )
+                val firstSymbolLayer = style.getLayers().firstOrNull { it is SymbolLayer }?.id
+                if (firstSymbolLayer != null) {
+                    style.addLayerBelow(tempLayer, firstSymbolLayer)
+                } else {
+                    style.addLayer(tempLayer)
+                }
             } else {
                 tempSource = existing
                 existing.setCoordinates(quad)
@@ -561,7 +594,7 @@ private class MapHolder {
             lastTempSnapshot = snapshot
         }
         style.getLayer(TEMP_LAYER)?.setProperties(
-            rasterOpacity(if (layer == WeatherLayer.Temp) 0.36f else 0.0f)
+            rasterOpacity(if (layer == WeatherLayer.Temp) TEMP_LAYER_OPACITY else 0.0f)
         )
     }
 }
@@ -696,7 +729,7 @@ private fun renderTemperatureBitmap(snapshot: ForecastSnapshot): Bitmap {
     val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     val northWest = project(snapshot.bounds.north, snapshot.bounds.west, 0.0)
     val southEast = project(snapshot.bounds.south, snapshot.bounds.east, 0.0)
-    val cell = 4
+    val cell = 3
     var y = 0
     while (y < height) {
         var x = 0
@@ -948,19 +981,31 @@ private class WeatherRepository {
 private data class RenderQuality(
     val rows: Int,
     val cols: Int,
-    val overlayCellPx: Float,
-    val labelDistance: Double,
-    val minLabels: Int,
 )
 
 private const val FORECAST_CACHE_TTL_MS = 10 * 60 * 1_000L
 private const val FORECAST_CACHE_LIMIT = 24
 
 private fun qualityForZoom(zoom: Double): RenderQuality = when {
-    zoom <= 7.0 -> RenderQuality(4, 4, 48f, 340.0, 5)
-    zoom <= 10.0 -> RenderQuality(5, 5, 44f, 340.0, 4)
-    zoom <= 13.0 -> RenderQuality(6, 6, 40f, 360.0, 4)
-    else -> RenderQuality(5, 5, 36f, 380.0, 3)
+    zoom <= 7.0 -> RenderQuality(4, 4)
+    zoom <= 10.0 -> RenderQuality(5, 5)
+    zoom <= 13.0 -> RenderQuality(6, 6)
+    else -> RenderQuality(5, 5)
+}
+
+private fun labelPolicyForZoom(zoom: Double): TempLabelPolicy = when {
+    zoom <= 7.0 -> TempLabelPolicy(0, maxLabels = 4, minLabels = 2, minDistancePx = 220.0, panHysteresisPx = 170.0)
+    zoom <= 10.0 -> TempLabelPolicy(1, maxLabels = 6, minLabels = 4, minDistancePx = 185.0, panHysteresisPx = 145.0)
+    zoom <= 13.0 -> TempLabelPolicy(2, maxLabels = 8, minLabels = 5, minDistancePx = 155.0, panHysteresisPx = 120.0)
+    else -> TempLabelPolicy(3, maxLabels = 5, minLabels = 3, minDistancePx = 190.0, panHysteresisPx = 130.0)
+}
+
+private fun shouldRefreshTempLabels(previous: CameraState?, current: CameraState, policy: TempLabelPolicy): Boolean {
+    previous ?: return true
+    if (labelPolicyForZoom(previous.zoom).zoomBand != policy.zoomBand) return true
+    val previousCenter = project(previous.latitude, previous.longitude, current.zoom)
+    val currentCenter = project(current.latitude, current.longitude, current.zoom)
+    return hypot(previousCenter.first - currentCenter.first, previousCenter.second - currentCenter.second) > policy.panHysteresisPx
 }
 
 private fun forecastZoomBucket(zoom: Double): Int = floor(zoom).toInt()
@@ -1008,46 +1053,51 @@ private fun buildGrid(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon:
     return points
 }
 
-private fun tempColor(temp: Double): Int = when {
-    temp <= 0 -> AndroidColor.argb(150, 59, 130, 246)
-    temp <= 8 -> AndroidColor.argb(140, 20, 184, 166)
-    temp <= 16 -> AndroidColor.argb(130, 34, 197, 94)
-    temp <= 24 -> AndroidColor.argb(145, 234, 179, 8)
-    temp <= 30 -> AndroidColor.argb(155, 249, 115, 22)
-    else -> AndroidColor.argb(165, 220, 38, 38)
+private fun tempColor(temp: Double): Int {
+    val lower = TEMP_COLOR_STOPS.lastOrNull { temp >= it.temp } ?: TEMP_COLOR_STOPS.first()
+    val upper = TEMP_COLOR_STOPS.firstOrNull { temp <= it.temp } ?: TEMP_COLOR_STOPS.last()
+    if (lower.temp == upper.temp) return AndroidColor.argb(138, lower.red, lower.green, lower.blue)
+    val t = ((temp - lower.temp) / (upper.temp - lower.temp)).coerceIn(0.0, 1.0)
+    return AndroidColor.argb(
+        138,
+        lerpColorChannel(lower.red, upper.red, t),
+        lerpColorChannel(lower.green, upper.green, t),
+        lerpColorChannel(lower.blue, upper.blue, t),
+    )
 }
 
-private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: CameraState): List<TempLabel> {
+private fun lerpColorChannel(start: Int, end: Int, t: Double): Int =
+    (start + (end - start) * t).roundToInt().coerceIn(0, 255)
+
+private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: CameraState, previousLabels: List<TempLabel>): List<TempLabel> {
     snapshot ?: return emptyList()
-    val quality = qualityForZoom(camera.zoom)
-    val visible = cameraBounds(camera).expand(1.08)
-    val northwest = project(visible.north, visible.west, camera.zoom)
-    val southeast = project(visible.south, visible.east, camera.zoom)
-    val step = quality.labelDistance
-    val minX = floor(min(northwest.first, southeast.first) / step).toInt() - 1
-    val maxX = ceil(max(northwest.first, southeast.first) / step).toInt() + 1
-    val minY = floor(min(northwest.second, southeast.second) / step).toInt() - 1
-    val maxY = ceil(max(northwest.second, southeast.second) / step).toInt() + 1
+    val policy = labelPolicyForZoom(camera.zoom)
     val candidates = mutableListOf<LabelCandidate>()
 
-    fun addCandidate(latitude: Double, longitude: Double, priority: Int) {
+    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0) {
         if (!snapshot.bounds.contains(latitude, longitude)) return
         val screen = screenPoint(latitude, longitude, camera)
-        if (screen.first < -100 || screen.second < -100 || screen.first > camera.width + 100 || screen.second > camera.height + 100) return
+        if (screen.first < -80 || screen.second < -80 || screen.first > camera.width + 80 || screen.second > camera.height + 80) return
         val temp = temperatureAt(latitude, longitude, snapshot)
-        candidates += LabelCandidate(latitude, longitude, temp, screen.first, screen.second, priority)
+        val centerDistance = hypot(screen.first - camera.width / 2.0, screen.second - camera.height / 2.0)
+        val edgePenalty = edgePenalty(screen.first, screen.second, camera)
+        val localGradient = localTemperatureGradient(latitude, longitude, snapshot)
+        val previousBoost = if (previousLabels.any { geoDistanceScore(it.latitude, it.longitude, latitude, longitude) < 0.0009 }) 4.0 else 0.0
+        val score = scoreBoost + previousBoost + localGradient * 1.8 - centerDistance / max(camera.width, camera.height) - edgePenalty
+        candidates += LabelCandidate(latitude, longitude, temp, screen.first, screen.second, priority, score)
     }
 
-    addCandidate(snapshot.current.latitude, snapshot.current.longitude, 0)
-    for (ix in minX..maxX) {
-        for (iy in minY..maxY) {
-            val jitterX = stableJitter(ix, iy, 17) * step * 0.42
-            val jitterY = stableJitter(ix, iy, 53) * step * 0.42
-            val worldX = (ix + 0.5) * step + jitterX
-            val worldY = (iy + 0.5) * step + jitterY
-            val point = unproject(worldX, worldY, camera.zoom)
-            addCandidate(point.first, point.second, 1)
-        }
+    addCandidate(snapshot.current.latitude, snapshot.current.longitude, 0, scoreBoost = 100.0)
+    previousLabels.forEach {
+        addCandidate(it.latitude, it.longitude, 1, scoreBoost = 8.0)
+    }
+    snapshot.points.forEachIndexed { index, point ->
+        if (index == 0) return@forEachIndexed
+        addCandidate(point.latitude, point.longitude, 2, scoreBoost = 2.5)
+    }
+    labelAnchorFractions(policy).forEachIndexed { index, anchor ->
+        val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
+        addCandidate(point.first, point.second, 3 + index, scoreBoost = 1.0)
     }
 
     fun pick(distance: Double): List<LabelCandidate> {
@@ -1056,23 +1106,60 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         candidates
             .sortedWith(
                 compareBy<LabelCandidate> { it.priority }
+                    .thenByDescending { it.score }
                     .thenBy { hypot(it.x - camera.width / 2.0, it.y - camera.height / 2.0) }
                     .thenByDescending { it.latitude }
                     .thenBy { it.longitude }
             )
             .forEach { candidate ->
-                if (chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }) {
+                if (chosen.size < policy.maxLabels &&
+                    chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }
+                ) {
                     chosen += candidate
                 }
             }
         return chosen
     }
 
-    val selected = pick(quality.labelDistance).let {
-        if (it.size < quality.minLabels) pick(quality.labelDistance * 0.72) else it
+    val selected = pick(policy.minDistancePx).let {
+        if (it.size < policy.minLabels) pick(policy.minDistancePx * 0.76) else it
     }
     return selected.map { TempLabel(it.latitude, it.longitude, it.temperature.roundToInt()) }
 }
+
+private fun labelAnchorFractions(policy: TempLabelPolicy): List<Pair<Double, Double>> = when (policy.zoomBand) {
+    0 -> listOf(0.36 to 0.40, 0.64 to 0.58, 0.50 to 0.30, 0.48 to 0.70)
+    1 -> listOf(0.28 to 0.36, 0.62 to 0.32, 0.40 to 0.58, 0.74 to 0.62, 0.52 to 0.44, 0.25 to 0.68)
+    2 -> listOf(0.26 to 0.34, 0.55 to 0.30, 0.76 to 0.44, 0.35 to 0.56, 0.62 to 0.62, 0.22 to 0.72, 0.82 to 0.72, 0.48 to 0.46)
+    else -> listOf(0.36 to 0.38, 0.66 to 0.42, 0.50 to 0.58, 0.30 to 0.68, 0.72 to 0.70)
+}
+
+private fun screenAnchorToLatLon(xFraction: Double, yFraction: Double, camera: CameraState): Pair<Double, Double> {
+    val center = project(camera.latitude, camera.longitude, camera.zoom)
+    return unproject(
+        center.first + camera.width * (xFraction - 0.5),
+        center.second + camera.height * (yFraction - 0.5),
+        camera.zoom,
+    )
+}
+
+private fun edgePenalty(x: Double, y: Double, camera: CameraState): Double {
+    val edge = min(min(x, camera.width - x), min(y, camera.height - y))
+    return if (edge >= 72.0) 0.0 else (72.0 - edge) / 72.0 * 3.0
+}
+
+private fun localTemperatureGradient(latitude: Double, longitude: Double, snapshot: ForecastSnapshot): Double {
+    val temp = temperatureAt(latitude, longitude, snapshot)
+    val near = snapshot.points
+        .asSequence()
+        .sortedBy { geoDistanceScore(latitude, longitude, it.latitude, it.longitude) }
+        .take(3)
+        .toList()
+    return near.maxOfOrNull { abs(it.temperature - temp) } ?: 0.0
+}
+
+private fun geoDistanceScore(latA: Double, lonA: Double, latB: Double, lonB: Double): Double =
+    (latA - latB) * (latA - latB) + (lonA - lonB) * (lonA - lonB)
 
 private fun temperatureAt(latitude: Double, longitude: Double, snapshot: ForecastSnapshot): Double {
     val target = project(latitude, longitude, 0.0)
@@ -1093,13 +1180,6 @@ private fun temperatureAt(latitude: Double, longitude: Double, snapshot: Forecas
     return if (weightSum == 0.0) nearest else temp / weightSum
 }
 
-private fun stableJitter(x: Int, y: Int, salt: Int): Double {
-    var value = x * 73856093 xor y * 19349663 xor salt * 83492791
-    value = value xor (value ushr 13)
-    value *= 1274126177
-    return ((value and 0x7fffffff).toDouble() / Int.MAX_VALUE.toDouble()) - 0.5
-}
-
 private data class LabelCandidate(
     val latitude: Double,
     val longitude: Double,
@@ -1107,6 +1187,7 @@ private data class LabelCandidate(
     val x: Double,
     val y: Double,
     val priority: Int,
+    val score: Double,
 )
 
 private fun MapLibreMap.cameraState(width: Int, height: Int): CameraState {
@@ -1248,3 +1329,14 @@ private const val RADAR_SOURCE = "radar-source"
 private const val RADAR_LAYER = "radar-layer"
 private const val TEMP_SOURCE = "temperature-source"
 private const val TEMP_LAYER = "temperature-layer"
+private const val TEMP_LAYER_OPACITY = 0.34f
+
+private val TEMP_COLOR_STOPS = listOf(
+    TempColorStop(-8.0, 37, 99, 235),
+    TempColorStop(0.0, 14, 165, 233),
+    TempColorStop(8.0, 20, 184, 166),
+    TempColorStop(16.0, 34, 197, 94),
+    TempColorStop(24.0, 234, 179, 8),
+    TempColorStop(30.0, 249, 115, 22),
+    TempColorStop(38.0, 220, 38, 38),
+)
