@@ -1083,8 +1083,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     val policy = labelPolicyForZoom(camera.zoom)
     val candidates = mutableListOf<LabelCandidate>()
 
-    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0, requireSnapshotBounds: Boolean = true) {
-        if (requireSnapshotBounds && !snapshot.bounds.contains(latitude, longitude)) return
+    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0) {
         val screen = screenPoint(latitude, longitude, camera)
         if (screen.first < -80 || screen.second < -80 || screen.first > camera.width + 80 || screen.second > camera.height + 80) return
         val temp = temperatureAt(latitude, longitude, snapshot)
@@ -1102,64 +1101,57 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     }
     labelAnchorFractions(policy).forEachIndexed { index, anchor ->
         val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
-        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08, requireSnapshotBounds = false)
+        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08)
     }
     snapshot.points.forEachIndexed { index, point ->
         if (index == 0) return@forEachIndexed
         addCandidate(point.latitude, point.longitude, 2, scoreBoost = 2.5)
     }
 
-    fun pick(distance: Double): List<LabelCandidate> {
-        val chosen = mutableListOf<LabelCandidate>()
-        val d2 = distance * distance
-        candidates
-            .sortedWith(
-                compareBy<LabelCandidate> { it.priority }
-                    .thenByDescending { it.score }
-                    .thenBy { hypot(it.x - camera.width / 2.0, it.y - camera.height / 2.0) }
-                    .thenByDescending { it.latitude }
-                    .thenBy { it.longitude }
-            )
-            .forEach { candidate ->
-                if (chosen.size < policy.maxLabels &&
-                    chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }
-                ) {
-                    chosen += candidate
-                }
-            }
-        return chosen
-    }
-
-    val selected = listOf(1.0, 0.82, 0.68, 0.56)
-        .asSequence()
-        .map { pick(policy.minDistancePx * it) }
-        .firstOrNull { it.size >= policy.minLabels }
-        ?: fillRequiredLabels(pick(policy.minDistancePx * 0.48), candidates, policy, minDistance = 84.0)
+    val selected = selectTemperatureLabels(candidates, policy, camera)
     return selected.map { TempLabel(it.latitude, it.longitude, it.temperature.roundToInt()) }
 }
 
-private fun fillRequiredLabels(
-    selected: List<LabelCandidate>,
+private fun selectTemperatureLabels(
     candidates: List<LabelCandidate>,
     policy: TempLabelPolicy,
-    minDistance: Double,
+    camera: CameraState,
 ): List<LabelCandidate> {
-    if (selected.size >= policy.minLabels || selected.size >= policy.maxLabels) return selected
-    val chosen = selected.toMutableList()
-    val minDistanceSquared = minDistance * minDistance
-    candidates
+    val ranked = candidates
+        .distinctBy { "${(it.latitude * 10_000).roundToInt()}:${(it.longitude * 10_000).roundToInt()}" }
         .sortedWith(
             compareBy<LabelCandidate> { it.priority }
                 .thenByDescending { it.score }
+                .thenBy { hypot(it.x - camera.width / 2.0, it.y - camera.height / 2.0) }
+                .thenByDescending { it.latitude }
+                .thenBy { it.longitude }
         )
-        .forEach { candidate ->
-            if (chosen.size >= policy.minLabels || chosen.size >= policy.maxLabels) return@forEach
-            if (chosen.any { geoDistanceScore(it.latitude, it.longitude, candidate.latitude, candidate.longitude) < 0.000001 }) return@forEach
-            if (chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < minDistanceSquared }) {
+
+    fun pick(distance: Double, targetCount: Int): List<LabelCandidate> {
+        val chosen = mutableListOf<LabelCandidate>()
+        val d2 = distance * distance
+        ranked.forEach { candidate ->
+            if (chosen.size >= targetCount || chosen.size >= policy.maxLabels) return@forEach
+            if (chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }) {
                 chosen += candidate
             }
         }
-    return chosen
+        return chosen
+    }
+
+    listOf(1.0, 0.82, 0.68, 0.56, 0.42).forEach { factor ->
+        val selected = pick(policy.minDistancePx * factor, policy.maxLabels)
+        if (selected.size >= policy.minLabels) return selected
+    }
+
+    val chosen = pick(56.0, policy.minLabels).toMutableList()
+    ranked.forEach { candidate ->
+        if (chosen.size >= policy.minLabels || chosen.size >= policy.maxLabels) return@forEach
+        if (chosen.none { geoDistanceScore(it.latitude, it.longitude, candidate.latitude, candidate.longitude) < 0.000001 }) {
+            chosen += candidate
+        }
+    }
+    return chosen.take(policy.maxLabels)
 }
 
 private fun labelAnchorFractions(policy: TempLabelPolicy): List<Pair<Double, Double>> = when (policy.zoomBand) {
