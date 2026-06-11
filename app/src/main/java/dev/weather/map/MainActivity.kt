@@ -1083,8 +1083,8 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     val policy = labelPolicyForZoom(camera.zoom)
     val candidates = mutableListOf<LabelCandidate>()
 
-    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0) {
-        if (!snapshot.bounds.contains(latitude, longitude)) return
+    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0, requireSnapshotBounds: Boolean = true) {
+        if (requireSnapshotBounds && !snapshot.bounds.contains(latitude, longitude)) return
         val screen = screenPoint(latitude, longitude, camera)
         if (screen.first < -80 || screen.second < -80 || screen.first > camera.width + 80 || screen.second > camera.height + 80) return
         val temp = temperatureAt(latitude, longitude, snapshot)
@@ -1102,7 +1102,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     }
     labelAnchorFractions(policy).forEachIndexed { index, anchor ->
         val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
-        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08)
+        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08, requireSnapshotBounds = false)
     }
     snapshot.points.forEachIndexed { index, point ->
         if (index == 0) return@forEachIndexed
@@ -1134,8 +1134,32 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         .asSequence()
         .map { pick(policy.minDistancePx * it) }
         .firstOrNull { it.size >= policy.minLabels }
-        ?: pick(policy.minDistancePx * 0.48)
+        ?: fillRequiredLabels(pick(policy.minDistancePx * 0.48), candidates, policy, minDistance = 84.0)
     return selected.map { TempLabel(it.latitude, it.longitude, it.temperature.roundToInt()) }
+}
+
+private fun fillRequiredLabels(
+    selected: List<LabelCandidate>,
+    candidates: List<LabelCandidate>,
+    policy: TempLabelPolicy,
+    minDistance: Double,
+): List<LabelCandidate> {
+    if (selected.size >= policy.minLabels || selected.size >= policy.maxLabels) return selected
+    val chosen = selected.toMutableList()
+    val minDistanceSquared = minDistance * minDistance
+    candidates
+        .sortedWith(
+            compareBy<LabelCandidate> { it.priority }
+                .thenByDescending { it.score }
+        )
+        .forEach { candidate ->
+            if (chosen.size >= policy.minLabels || chosen.size >= policy.maxLabels) return@forEach
+            if (chosen.any { geoDistanceScore(it.latitude, it.longitude, candidate.latitude, candidate.longitude) < 0.000001 }) return@forEach
+            if (chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < minDistanceSquared }) {
+                chosen += candidate
+            }
+        }
+    return chosen
 }
 
 private fun labelAnchorFractions(policy: TempLabelPolicy): List<Pair<Double, Double>> = when (policy.zoomBand) {
