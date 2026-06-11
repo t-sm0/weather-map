@@ -90,6 +90,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.LinkedHashMap
 import java.util.Locale
 import java.util.concurrent.Executors
 import kotlinx.coroutines.delay
@@ -157,6 +158,17 @@ private data class ForecastUiState(
     val loading: Boolean = true,
     val error: String? = null,
     val cacheHit: Boolean = false,
+)
+
+private data class ForecastResult(val snapshot: ForecastSnapshot, val cacheHit: Boolean)
+
+private data class ForecastCacheKey(
+    val hourOffset: Int,
+    val zoomBucket: Int,
+    val northBucket: Int,
+    val southBucket: Int,
+    val westBucket: Int,
+    val eastBucket: Int,
 )
 
 private data class RadarFrame(val path: String, val time: Long)
@@ -278,10 +290,15 @@ private fun WeatherMapApp(
         repository.fetchForecast(renderCamera, selectedHour) { result ->
             if (token != loadToken) return@fetchForecast
             result.onSuccess {
-                forecastState = ForecastUiState(snapshot = it, loading = false, error = null, cacheHit = false)
-                status = "Temp ${formatWeatherTime(it.time)} · ${it.points.size} Punkte · Neu"
+                forecastState = ForecastUiState(snapshot = it.snapshot, loading = false, error = null, cacheHit = it.cacheHit)
+                val source = if (it.cacheHit) "Cache" else "Neu"
+                status = "Temp ${formatWeatherTime(it.snapshot.time)} · ${it.snapshot.points.size} Punkte · $source"
             }.onFailure {
-                val message = it.message?.take(90) ?: "Vorhersage nicht geladen"
+                val message = if (it.message?.contains("HTTP 429") == true) {
+                    "Temperaturdaten limitiert · Cache wird weiter genutzt"
+                } else {
+                    it.message?.take(90) ?: "Vorhersage nicht geladen"
+                }
                 forecastState = forecastState.copy(loading = false, error = message, cacheHit = false)
                 status = message
             }
@@ -834,13 +851,31 @@ private fun Metric(label: String, value: String, modifier: Modifier = Modifier) 
 private class WeatherRepository {
     private val executor = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
+    private val forecastCache = LinkedHashMap<ForecastCacheKey, ForecastSnapshot>(24, 0.75f, true)
+    private val forecastCacheTimes = mutableMapOf<ForecastCacheKey, Long>()
+    private val inFlightForecasts = mutableMapOf<ForecastCacheKey, MutableList<(Result<ForecastResult>) -> Unit>>()
 
-    fun fetchForecast(camera: CameraState, hourOffset: Int, callback: (Result<ForecastSnapshot>) -> Unit) {
-        val bounds = cameraBounds(camera).expand(1.35)
+    fun fetchForecast(camera: CameraState, hourOffset: Int, callback: (Result<ForecastResult>) -> Unit) {
+        val visibleBounds = cameraBounds(camera)
         val quality = qualityForZoom(camera.zoom)
-        val grid = buildGrid(bounds, quality.rows, quality.cols, camera.latitude, camera.longitude)
+        val zoomBucket = forecastZoomBucket(camera.zoom)
+        val bounds = quantizedForecastBounds(visibleBounds.expand(1.8), zoomBucket)
+        val key = forecastCacheKey(bounds, hourOffset, zoomBucket)
+        val now = SystemClock.elapsedRealtime()
+        forecastCache[key]?.let { cached ->
+            if (now - (forecastCacheTimes[key] ?: 0L) <= FORECAST_CACHE_TTL_MS && cached.bounds.contains(visibleBounds)) {
+                callback(Result.success(ForecastResult(cached, cacheHit = true)))
+                return
+            }
+        }
+        inFlightForecasts[key]?.let {
+            it += callback
+            return
+        }
+        inFlightForecasts[key] = mutableListOf(callback)
         executor.execute {
             runCatching {
+                val grid = buildGrid(bounds, quality.rows, quality.cols, camera.latitude, camera.longitude)
                 val latitudes = grid.joinToString(",") { "%.4f".format(Locale.US, it.first) }
                 val longitudes = grid.joinToString(",") { "%.4f".format(Locale.US, it.second) }
                 val url = "https://api.open-meteo.com/v1/forecast" +
@@ -848,9 +883,17 @@ private class WeatherRepository {
                     "&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m" +
                     "&hourly=temperature_2m,apparent_temperature,weather_code,wind_speed_10m" +
                     "&forecast_days=3&timezone=auto"
-                parseForecast(readText(url), grid, bounds, camera, hourOffset)
+                ForecastResult(parseForecast(readText(url), grid, bounds, camera, hourOffset), cacheHit = false)
             }.also { result ->
-                main.post { callback(result) }
+                main.post {
+                    result.onSuccess {
+                        forecastCache[key] = it.snapshot
+                        forecastCacheTimes[key] = SystemClock.elapsedRealtime()
+                        trimForecastCache()
+                    }
+                    val callbacks = inFlightForecasts.remove(key).orEmpty()
+                    callbacks.forEach { it(result) }
+                }
             }
         }
     }
@@ -931,6 +974,14 @@ private class WeatherRepository {
         }
         return body
     }
+
+    private fun trimForecastCache() {
+        while (forecastCache.size > FORECAST_CACHE_LIMIT) {
+            val eldest = forecastCache.keys.firstOrNull() ?: return
+            forecastCache.remove(eldest)
+            forecastCacheTimes.remove(eldest)
+        }
+    }
 }
 
 private data class RenderQuality(
@@ -941,12 +992,48 @@ private data class RenderQuality(
     val minLabels: Int,
 )
 
+private const val FORECAST_CACHE_TTL_MS = 10 * 60 * 1_000L
+private const val FORECAST_CACHE_LIMIT = 24
+
 private fun qualityForZoom(zoom: Double): RenderQuality = when {
-    zoom <= 7.0 -> RenderQuality(8, 8, 42f, 300.0, 6)
-    zoom <= 10.0 -> RenderQuality(9, 9, 38f, 300.0, 5)
-    zoom <= 13.0 -> RenderQuality(10, 10, 34f, 320.0, 4)
-    else -> RenderQuality(9, 9, 30f, 340.0, 3)
+    zoom <= 7.0 -> RenderQuality(4, 4, 48f, 340.0, 5)
+    zoom <= 10.0 -> RenderQuality(5, 5, 44f, 340.0, 4)
+    zoom <= 13.0 -> RenderQuality(6, 6, 40f, 360.0, 4)
+    else -> RenderQuality(5, 5, 36f, 380.0, 3)
 }
+
+private fun forecastZoomBucket(zoom: Double): Int = floor(zoom).toInt()
+
+private fun forecastStepForZoomBucket(zoomBucket: Int): Double = when {
+    zoomBucket <= 7 -> 2.0
+    zoomBucket <= 10 -> 0.8
+    zoomBucket <= 13 -> 0.35
+    else -> 0.18
+}
+
+private fun quantizedForecastBounds(bounds: GeoBounds, zoomBucket: Int): GeoBounds {
+    val step = forecastStepForZoomBucket(zoomBucket)
+    return GeoBounds(
+        north = min(85.0, ceil(bounds.north / step) * step),
+        south = max(-85.0, floor(bounds.south / step) * step),
+        west = max(-180.0, floor(bounds.west / step) * step),
+        east = min(180.0, ceil(bounds.east / step) * step),
+    )
+}
+
+private fun forecastCacheKey(bounds: GeoBounds, hourOffset: Int, zoomBucket: Int): ForecastCacheKey {
+    val step = forecastStepForZoomBucket(zoomBucket)
+    return ForecastCacheKey(
+        hourOffset = hourOffset,
+        zoomBucket = zoomBucket,
+        northBucket = roundToBucket(bounds.north, step),
+        southBucket = roundToBucket(bounds.south, step),
+        westBucket = roundToBucket(bounds.west, step),
+        eastBucket = roundToBucket(bounds.east, step),
+    )
+}
+
+private fun roundToBucket(value: Double, step: Double): Int = (value / step).roundToInt()
 
 private fun buildGrid(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon: Double): List<Pair<Double, Double>> {
     val points = mutableListOf(lat to lon)
