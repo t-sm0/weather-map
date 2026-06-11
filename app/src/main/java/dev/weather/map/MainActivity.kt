@@ -142,9 +142,23 @@ private data class ProjectedWeatherPoint(
     val y: Double,
 )
 
-private data class TempLabel(val latitude: Double, val longitude: Double, val value: Int)
+private data class TempLabel(
+    val id: String,
+    val latitude: Double,
+    val longitude: Double,
+    val value: Int,
+    val name: String? = null,
+)
 
 private data class ProjectedTempLabel(val label: TempLabel, val x: Double, val y: Double)
+
+private data class TempCityAnchor(
+    val id: String,
+    val name: String,
+    val latitude: Double,
+    val longitude: Double,
+    val rank: Int,
+)
 
 private data class TempLabelPolicy(
     val zoomBand: Int,
@@ -1083,33 +1097,61 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     val policy = labelPolicyForZoom(camera.zoom)
     val candidates = mutableListOf<LabelCandidate>()
 
-    fun addCandidate(latitude: Double, longitude: Double, priority: Int, scoreBoost: Double = 0.0) {
+    fun addCandidate(
+        id: String,
+        name: String?,
+        latitude: Double,
+        longitude: Double,
+        priority: Int,
+        scoreBoost: Double = 0.0,
+        rank: Int = 10_000,
+    ) {
         val screen = screenPoint(latitude, longitude, camera)
-        if (screen.first < -80 || screen.second < -80 || screen.first > camera.width + 80 || screen.second > camera.height + 80) return
+        if (screen.first < -180 || screen.second < -180 || screen.first > camera.width + 180 || screen.second > camera.height + 180) return
         val temp = temperatureAt(latitude, longitude, snapshot)
         val centerDistance = hypot(screen.first - camera.width / 2.0, screen.second - camera.height / 2.0)
         val edgePenalty = edgePenalty(screen.first, screen.second, camera)
         val localGradient = localTemperatureGradient(latitude, longitude, snapshot)
-        val previousBoost = if (previousLabels.any { geoDistanceScore(it.latitude, it.longitude, latitude, longitude) < 0.0009 }) 4.0 else 0.0
-        val score = scoreBoost + previousBoost + localGradient * 1.8 - centerDistance / max(camera.width, camera.height) - edgePenalty
-        candidates += LabelCandidate(latitude, longitude, temp, screen.first, screen.second, priority, score)
+        val previousBoost = if (previousLabels.any { it.id == id }) 4.0 else 0.0
+        val score = scoreBoost + previousBoost + localGradient * 1.8 - centerDistance / max(camera.width, camera.height) - edgePenalty - rank / 10_000.0
+        candidates += LabelCandidate(id, name, latitude, longitude, temp, screen.first, screen.second, priority, score)
     }
 
-    addCandidate(snapshot.current.latitude, snapshot.current.longitude, 0, scoreBoost = 100.0)
+    val visibleCities = TEMP_CITY_ANCHORS.mapNotNull { city ->
+        val screen = screenPoint(city.latitude, city.longitude, camera)
+        if (screen.first < -180 || screen.second < -180 || screen.first > camera.width + 180 || screen.second > camera.height + 180) {
+            null
+        } else {
+            city to screen
+        }
+    }
+
+    visibleCities.forEach { (city, _) ->
+        addCandidate(city.id, city.name, city.latitude, city.longitude, priority = 1, scoreBoost = 8.0, rank = city.rank)
+    }
+
+    midpointCandidates(visibleCities, policy, camera).forEachIndexed { index, midpoint ->
+        addCandidate(
+            id = midpoint.id,
+            name = null,
+            latitude = midpoint.latitude,
+            longitude = midpoint.longitude,
+            priority = 2,
+            scoreBoost = 5.2 - index * 0.1,
+            rank = midpoint.rank,
+        )
+    }
+
     previousLabels.forEach {
-        addCandidate(it.latitude, it.longitude, 1, scoreBoost = 8.0)
+        addCandidate(it.id, it.name, it.latitude, it.longitude, priority = 0, scoreBoost = 10.0)
     }
-    labelAnchorFractions(policy).forEachIndexed { index, anchor ->
-        val point = screenAnchorToLatLon(anchor.first, anchor.second, camera)
-        addCandidate(point.first, point.second, 2, scoreBoost = 4.0 - index * 0.08)
-    }
-    snapshot.points.forEachIndexed { index, point ->
-        if (index == 0) return@forEachIndexed
-        addCandidate(point.latitude, point.longitude, 2, scoreBoost = 2.5)
+
+    if (candidates.isEmpty()) {
+        addCandidate("current-location", null, snapshot.current.latitude, snapshot.current.longitude, priority = 9, scoreBoost = 1.0)
     }
 
     val selected = selectTemperatureLabels(candidates, policy, camera)
-    return selected.map { TempLabel(it.latitude, it.longitude, it.temperature.roundToInt()) }
+    return selected.map { TempLabel(it.id, it.latitude, it.longitude, it.temperature.roundToInt(), it.name) }
 }
 
 private fun selectTemperatureLabels(
@@ -1118,7 +1160,7 @@ private fun selectTemperatureLabels(
     camera: CameraState,
 ): List<LabelCandidate> {
     val ranked = candidates
-        .distinctBy { "${(it.latitude * 10_000).roundToInt()}:${(it.longitude * 10_000).roundToInt()}" }
+        .distinctBy { it.id }
         .sortedWith(
             compareBy<LabelCandidate> { it.priority }
                 .thenByDescending { it.score }
@@ -1154,20 +1196,53 @@ private fun selectTemperatureLabels(
     return chosen.take(policy.maxLabels)
 }
 
-private fun labelAnchorFractions(policy: TempLabelPolicy): List<Pair<Double, Double>> = when (policy.zoomBand) {
-    0 -> listOf(0.30 to 0.34, 0.70 to 0.34, 0.34 to 0.56, 0.66 to 0.56, 0.40 to 0.76, 0.76 to 0.74)
-    1 -> listOf(0.28 to 0.36, 0.62 to 0.32, 0.40 to 0.58, 0.74 to 0.62, 0.52 to 0.44, 0.25 to 0.68)
-    2 -> listOf(0.26 to 0.34, 0.55 to 0.30, 0.76 to 0.44, 0.35 to 0.56, 0.62 to 0.62, 0.22 to 0.72, 0.82 to 0.72, 0.48 to 0.46)
-    else -> listOf(0.36 to 0.38, 0.66 to 0.42, 0.50 to 0.58, 0.30 to 0.68, 0.72 to 0.70)
+private data class MidpointCandidate(
+    val id: String,
+    val latitude: Double,
+    val longitude: Double,
+    val rank: Int,
+)
+
+private fun midpointCandidates(
+    visibleCities: List<Pair<TempCityAnchor, Pair<Double, Double>>>,
+    policy: TempLabelPolicy,
+    camera: CameraState,
+): List<MidpointCandidate> {
+    val threshold = if (policy.zoomBand <= 0) 260.0 else 300.0
+    val candidates = mutableListOf<Pair<MidpointCandidate, Double>>()
+    visibleCities.forEachIndexed { leftIndex, left ->
+        for (rightIndex in leftIndex + 1 until visibleCities.size) {
+            val right = visibleCities[rightIndex]
+            val distance = hypot(left.second.first - right.second.first, left.second.second - right.second.second)
+            if (distance <= threshold) continue
+            val midLat = (left.first.latitude + right.first.latitude) / 2.0
+            val midLon = midpointLongitude(left.first.longitude, right.first.longitude)
+            val screen = screenPoint(midLat, midLon, camera)
+            if (screen.first !in -80.0..(camera.width + 80.0) || screen.second !in -80.0..(camera.height + 80.0)) continue
+            val id = "mid:${left.first.id}:${right.first.id}"
+            val rank = min(left.first.rank, right.first.rank) + 5_000
+            candidates += MidpointCandidate(id, midLat, midLon, rank) to distance
+        }
+    }
+    return candidates
+        .sortedWith(compareByDescending<Pair<MidpointCandidate, Double>> { it.second }.thenBy { it.first.id })
+        .map { it.first }
+        .take(policy.maxLabels)
 }
 
-private fun screenAnchorToLatLon(xFraction: Double, yFraction: Double, camera: CameraState): Pair<Double, Double> {
-    val center = project(camera.latitude, camera.longitude, camera.zoom)
-    return unproject(
-        center.first + camera.width * (xFraction - 0.5),
-        center.second + camera.height * (yFraction - 0.5),
-        camera.zoom,
-    )
+private fun midpointLongitude(left: Double, right: Double): Double {
+    val delta = right - left
+    return when {
+        delta > 180.0 -> (left + right - 360.0) / 2.0
+        delta < -180.0 -> (left + right + 360.0) / 2.0
+        else -> (left + right) / 2.0
+    }.let {
+        when {
+            it < -180.0 -> it + 360.0
+            it > 180.0 -> it - 360.0
+            else -> it
+        }
+    }
 }
 
 private fun edgePenalty(x: Double, y: Double, camera: CameraState): Double {
@@ -1208,6 +1283,8 @@ private fun temperatureAt(latitude: Double, longitude: Double, snapshot: Forecas
 }
 
 private data class LabelCandidate(
+    val id: String,
+    val name: String?,
     val latitude: Double,
     val longitude: Double,
     val temperature: Double,
@@ -1368,4 +1445,62 @@ private val TEMP_COLOR_STOPS = listOf(
     TempColorStop(24.0, 234, 179, 8),
     TempColorStop(30.0, 249, 115, 22),
     TempColorStop(38.0, 220, 38, 38),
+)
+
+private val TEMP_CITY_ANCHORS = listOf(
+    TempCityAnchor("berlin", "Berlin", 52.5200, 13.4050, 10),
+    TempCityAnchor("hamburg", "Hamburg", 53.5511, 9.9937, 20),
+    TempCityAnchor("munich", "Muenchen", 48.1351, 11.5820, 30),
+    TempCityAnchor("cologne", "Koeln", 50.9375, 6.9603, 40),
+    TempCityAnchor("frankfurt", "Frankfurt", 50.1109, 8.6821, 50),
+    TempCityAnchor("stuttgart", "Stuttgart", 48.7758, 9.1829, 60),
+    TempCityAnchor("duesseldorf", "Duesseldorf", 51.2277, 6.7735, 70),
+    TempCityAnchor("dortmund", "Dortmund", 51.5136, 7.4653, 80),
+    TempCityAnchor("leipzig", "Leipzig", 51.3397, 12.3731, 90),
+    TempCityAnchor("dresden", "Dresden", 51.0504, 13.7373, 100),
+    TempCityAnchor("hannover", "Hannover", 52.3759, 9.7320, 110),
+    TempCityAnchor("bremen", "Bremen", 53.0793, 8.8017, 120),
+    TempCityAnchor("nuremberg", "Nuernberg", 49.4521, 11.0767, 130),
+    TempCityAnchor("paris", "Paris", 48.8566, 2.3522, 10),
+    TempCityAnchor("london", "London", 51.5072, -0.1276, 10),
+    TempCityAnchor("madrid", "Madrid", 40.4168, -3.7038, 10),
+    TempCityAnchor("rome", "Rom", 41.9028, 12.4964, 10),
+    TempCityAnchor("vienna", "Wien", 48.2082, 16.3738, 20),
+    TempCityAnchor("prague", "Prag", 50.0755, 14.4378, 30),
+    TempCityAnchor("warsaw", "Warschau", 52.2297, 21.0122, 20),
+    TempCityAnchor("amsterdam", "Amsterdam", 52.3676, 4.9041, 30),
+    TempCityAnchor("brussels", "Bruessel", 50.8503, 4.3517, 40),
+    TempCityAnchor("copenhagen", "Kopenhagen", 55.6761, 12.5683, 40),
+    TempCityAnchor("stockholm", "Stockholm", 59.3293, 18.0686, 30),
+    TempCityAnchor("oslo", "Oslo", 59.9139, 10.7522, 40),
+    TempCityAnchor("helsinki", "Helsinki", 60.1699, 24.9384, 50),
+    TempCityAnchor("zurich", "Zuerich", 47.3769, 8.5417, 50),
+    TempCityAnchor("athens", "Athen", 37.9838, 23.7275, 30),
+    TempCityAnchor("lisbon", "Lissabon", 38.7223, -9.1393, 40),
+    TempCityAnchor("dublin", "Dublin", 53.3498, -6.2603, 50),
+    TempCityAnchor("budapest", "Budapest", 47.4979, 19.0402, 40),
+    TempCityAnchor("istanbul", "Istanbul", 41.0082, 28.9784, 20),
+    TempCityAnchor("moscow", "Moskau", 55.7558, 37.6173, 20),
+    TempCityAnchor("new-york", "New York", 40.7128, -74.0060, 10),
+    TempCityAnchor("los-angeles", "Los Angeles", 34.0522, -118.2437, 20),
+    TempCityAnchor("chicago", "Chicago", 41.8781, -87.6298, 30),
+    TempCityAnchor("toronto", "Toronto", 43.6532, -79.3832, 30),
+    TempCityAnchor("mexico-city", "Mexico City", 19.4326, -99.1332, 20),
+    TempCityAnchor("sao-paulo", "Sao Paulo", -23.5558, -46.6396, 10),
+    TempCityAnchor("buenos-aires", "Buenos Aires", -34.6037, -58.3816, 20),
+    TempCityAnchor("cairo", "Kairo", 30.0444, 31.2357, 20),
+    TempCityAnchor("lagos", "Lagos", 6.5244, 3.3792, 30),
+    TempCityAnchor("johannesburg", "Johannesburg", -26.2041, 28.0473, 40),
+    TempCityAnchor("dubai", "Dubai", 25.2048, 55.2708, 30),
+    TempCityAnchor("delhi", "Delhi", 28.6139, 77.2090, 10),
+    TempCityAnchor("mumbai", "Mumbai", 19.0760, 72.8777, 20),
+    TempCityAnchor("beijing", "Beijing", 39.9042, 116.4074, 10),
+    TempCityAnchor("shanghai", "Shanghai", 31.2304, 121.4737, 20),
+    TempCityAnchor("tokyo", "Tokyo", 35.6762, 139.6503, 10),
+    TempCityAnchor("seoul", "Seoul", 37.5665, 126.9780, 20),
+    TempCityAnchor("bangkok", "Bangkok", 13.7563, 100.5018, 30),
+    TempCityAnchor("singapore", "Singapore", 1.3521, 103.8198, 30),
+    TempCityAnchor("jakarta", "Jakarta", -6.2088, 106.8456, 20),
+    TempCityAnchor("sydney", "Sydney", -33.8688, 151.2093, 20),
+    TempCityAnchor("melbourne", "Melbourne", -37.8136, 144.9631, 30),
 )
