@@ -1019,9 +1019,10 @@ private fun labelPolicyForZoom(zoom: Double): TempLabelPolicy = when {
 private fun shouldRefreshTempLabels(previous: CameraState?, current: CameraState, policy: TempLabelPolicy): Boolean {
     previous ?: return true
     if (labelPolicyForZoom(previous.zoom).zoomBand != policy.zoomBand) return true
+    if (abs(previous.zoom - current.zoom) > 0.25) return true
     val previousCenter = project(previous.latitude, previous.longitude, current.zoom)
     val currentCenter = project(current.latitude, current.longitude, current.zoom)
-    return hypot(previousCenter.first - currentCenter.first, previousCenter.second - currentCenter.second) > policy.panHysteresisPx
+    return hypot(previousCenter.first - currentCenter.first, previousCenter.second - currentCenter.second) > policy.panHysteresisPx * 0.72
 }
 
 private fun forecastZoomBucket(zoom: Double): Int = floor(zoom).toInt()
@@ -1142,6 +1143,18 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         )
     }
 
+    fixedGeoAnchors(camera, policy).forEachIndexed { index, anchor ->
+        addCandidate(
+            id = anchor.id,
+            name = null,
+            latitude = anchor.latitude,
+            longitude = anchor.longitude,
+            priority = 3,
+            scoreBoost = 3.2 - index * 0.03,
+            rank = anchor.rank,
+        )
+    }
+
     previousLabels.forEach {
         addCandidate(it.id, it.name, it.latitude, it.longitude, priority = 0, scoreBoost = 10.0)
     }
@@ -1203,6 +1216,45 @@ private data class MidpointCandidate(
     val rank: Int,
 )
 
+private data class FixedGeoAnchor(
+    val id: String,
+    val latitude: Double,
+    val longitude: Double,
+    val rank: Int,
+)
+
+private fun fixedGeoAnchors(camera: CameraState, policy: TempLabelPolicy): List<FixedGeoAnchor> {
+    val bounds = cameraBounds(camera).expand(1.05)
+    val step = fixedGeoAnchorStep(policy.zoomBand)
+    val minLatBucket = floor(bounds.south / step).toInt() - 1
+    val maxLatBucket = ceil(bounds.north / step).toInt() + 1
+    val minLonBucket = floor(bounds.west / step).toInt() - 1
+    val maxLonBucket = ceil(bounds.east / step).toInt() + 1
+    val anchors = mutableListOf<Pair<FixedGeoAnchor, Double>>()
+    for (latBucket in minLatBucket..maxLatBucket) {
+        val latitude = (latBucket * step).coerceIn(-84.0, 84.0)
+        for (lonBucket in minLonBucket..maxLonBucket) {
+            val longitude = normalizeLongitude(lonBucket * step)
+            val screen = screenPoint(latitude, longitude, camera)
+            if (screen.first !in 24.0..(camera.width - 24.0) || screen.second !in 88.0..(camera.height - 132.0)) continue
+            val centerDistance = hypot(screen.first - camera.width / 2.0, screen.second - camera.height / 2.0)
+            val id = "geo:${(latitude * 100).roundToInt()}:${(longitude * 100).roundToInt()}"
+            anchors += FixedGeoAnchor(id, latitude, longitude, 20_000 + abs(latBucket) + abs(lonBucket)) to centerDistance
+        }
+    }
+    return anchors
+        .sortedWith(compareBy<Pair<FixedGeoAnchor, Double>> { it.second }.thenBy { it.first.id })
+        .map { it.first }
+        .take(policy.maxLabels * 3)
+}
+
+private fun fixedGeoAnchorStep(zoomBand: Int): Double = when (zoomBand) {
+    0 -> 2.0
+    1 -> 1.0
+    2 -> 0.5
+    else -> 0.25
+}
+
 private fun midpointCandidates(
     visibleCities: List<Pair<TempCityAnchor, Pair<Double, Double>>>,
     policy: TempLabelPolicy,
@@ -1243,6 +1295,13 @@ private fun midpointLongitude(left: Double, right: Double): Double {
             else -> it
         }
     }
+}
+
+private fun normalizeLongitude(value: Double): Double {
+    var longitude = value
+    while (longitude < -180.0) longitude += 360.0
+    while (longitude > 180.0) longitude -= 360.0
+    return longitude
 }
 
 private fun edgePenalty(x: Double, y: Double, camera: CameraState): Double {
