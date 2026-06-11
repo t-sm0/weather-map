@@ -1010,10 +1010,10 @@ private fun qualityForZoom(zoom: Double): RenderQuality = when {
 }
 
 private fun labelPolicyForZoom(zoom: Double): TempLabelPolicy = when {
-    zoom <= 7.0 -> TempLabelPolicy(0, maxLabels = 6, minLabels = 5, minDistancePx = 155.0, panHysteresisPx = 170.0)
-    zoom <= 10.0 -> TempLabelPolicy(1, maxLabels = 7, minLabels = 5, minDistancePx = 165.0, panHysteresisPx = 145.0)
-    zoom <= 13.0 -> TempLabelPolicy(2, maxLabels = 8, minLabels = 5, minDistancePx = 155.0, panHysteresisPx = 120.0)
-    else -> TempLabelPolicy(3, maxLabels = 5, minLabels = 3, minDistancePx = 190.0, panHysteresisPx = 130.0)
+    zoom <= 7.0 -> TempLabelPolicy(0, maxLabels = 10, minLabels = 8, minDistancePx = 105.0, panHysteresisPx = 150.0)
+    zoom <= 10.0 -> TempLabelPolicy(1, maxLabels = 10, minLabels = 7, minDistancePx = 115.0, panHysteresisPx = 125.0)
+    zoom <= 13.0 -> TempLabelPolicy(2, maxLabels = 9, minLabels = 6, minDistancePx = 125.0, panHysteresisPx = 105.0)
+    else -> TempLabelPolicy(3, maxLabels = 7, minLabels = 5, minDistancePx = 135.0, panHysteresisPx = 110.0)
 }
 
 private fun shouldRefreshTempLabels(previous: CameraState?, current: CameraState, policy: TempLabelPolicy): Boolean {
@@ -1108,7 +1108,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         rank: Int = 10_000,
     ) {
         val screen = screenPoint(latitude, longitude, camera)
-        if (screen.first < -180 || screen.second < -180 || screen.first > camera.width + 180 || screen.second > camera.height + 180) return
+        if (!isUsableLabelScreenPoint(screen.first, screen.second, camera)) return
         val temp = temperatureAt(latitude, longitude, snapshot)
         val centerDistance = hypot(screen.first - camera.width / 2.0, screen.second - camera.height / 2.0)
         val edgePenalty = edgePenalty(screen.first, screen.second, camera)
@@ -1120,7 +1120,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
 
     val visibleCities = TEMP_CITY_ANCHORS.mapNotNull { city ->
         val screen = screenPoint(city.latitude, city.longitude, camera)
-        if (screen.first < -180 || screen.second < -180 || screen.first > camera.width + 180 || screen.second > camera.height + 180) {
+        if (!isUsableLabelScreenPoint(screen.first, screen.second, camera)) {
             null
         } else {
             city to screen
@@ -1194,12 +1194,12 @@ private fun selectTemperatureLabels(
         return chosen
     }
 
-    listOf(1.0, 0.82, 0.68, 0.56, 0.42).forEach { factor ->
+    listOf(1.0, 0.82, 0.68, 0.56, 0.42, 0.32, 0.24).forEach { factor ->
         val selected = pick(policy.minDistancePx * factor, policy.maxLabels)
         if (selected.size >= policy.minLabels) return selected
     }
 
-    val chosen = pick(56.0, policy.minLabels).toMutableList()
+    val chosen = pick(36.0, policy.minLabels).toMutableList()
     ranked.forEach { candidate ->
         if (chosen.size >= policy.minLabels || chosen.size >= policy.maxLabels) return@forEach
         if (chosen.none { geoDistanceScore(it.latitude, it.longitude, candidate.latitude, candidate.longitude) < 0.000001 }) {
@@ -1236,7 +1236,7 @@ private fun fixedGeoAnchors(camera: CameraState, policy: TempLabelPolicy): List<
         for (lonBucket in minLonBucket..maxLonBucket) {
             val longitude = normalizeLongitude(lonBucket * step)
             val screen = screenPoint(latitude, longitude, camera)
-            if (screen.first !in 24.0..(camera.width - 24.0) || screen.second !in 88.0..(camera.height - 132.0)) continue
+            if (!isUsableLabelScreenPoint(screen.first, screen.second, camera)) continue
             val centerDistance = hypot(screen.first - camera.width / 2.0, screen.second - camera.height / 2.0)
             val id = "geo:${(latitude * 100).roundToInt()}:${(longitude * 100).roundToInt()}"
             anchors += FixedGeoAnchor(id, latitude, longitude, 20_000 + abs(latBucket) + abs(lonBucket)) to centerDistance
@@ -1245,14 +1245,22 @@ private fun fixedGeoAnchors(camera: CameraState, policy: TempLabelPolicy): List<
     return anchors
         .sortedWith(compareBy<Pair<FixedGeoAnchor, Double>> { it.second }.thenBy { it.first.id })
         .map { it.first }
-        .take(policy.maxLabels * 3)
+        .take(policy.maxLabels * 6)
 }
 
 private fun fixedGeoAnchorStep(zoomBand: Int): Double = when (zoomBand) {
-    0 -> 2.0
-    1 -> 1.0
-    2 -> 0.5
-    else -> 0.25
+    0 -> 1.0
+    1 -> 0.5
+    2 -> 0.25
+    else -> 0.125
+}
+
+private fun isUsableLabelScreenPoint(x: Double, y: Double, camera: CameraState): Boolean {
+    val horizontalPad = 12.0
+    val topPad = 72.0
+    val bottomPad = 92.0
+    return x in horizontalPad..(camera.width - horizontalPad) &&
+        y in topPad..(camera.height - bottomPad)
 }
 
 private fun midpointCandidates(
