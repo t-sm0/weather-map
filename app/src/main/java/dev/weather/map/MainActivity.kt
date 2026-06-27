@@ -158,6 +158,7 @@ private data class TempCityAnchor(
     val latitude: Double,
     val longitude: Double,
     val rank: Int,
+    val isCapital: Boolean = false,
 )
 
 private data class TempLabelPolicy(
@@ -1106,6 +1107,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         priority: Int,
         scoreBoost: Double = 0.0,
         rank: Int = 10_000,
+        isCapital: Boolean = false,
     ) {
         val screen = screenPoint(latitude, longitude, camera)
         if (!isUsableLabelScreenPoint(screen.first, screen.second, camera)) return
@@ -1115,7 +1117,7 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
         val localGradient = localTemperatureGradient(latitude, longitude, snapshot)
         val previousBoost = if (previousLabels.any { it.id == id }) 4.0 else 0.0
         val score = scoreBoost + previousBoost + localGradient * 1.8 - centerDistance / max(camera.width, camera.height) - edgePenalty - rank / 10_000.0
-        candidates += LabelCandidate(id, name, latitude, longitude, temp, screen.first, screen.second, priority, score)
+        candidates += LabelCandidate(id, name, latitude, longitude, temp, screen.first, screen.second, priority, score, isCapital)
     }
 
     val visibleCities = TEMP_CITY_ANCHORS.mapNotNull { city ->
@@ -1128,7 +1130,16 @@ private fun visibleTemperatureLabels(snapshot: ForecastSnapshot?, camera: Camera
     }
 
     visibleCities.forEach { (city, _) ->
-        addCandidate(city.id, city.name, city.latitude, city.longitude, priority = 1, scoreBoost = 8.0, rank = city.rank)
+        addCandidate(
+            city.id,
+            city.name,
+            city.latitude,
+            city.longitude,
+            priority = if (city.isCapital) 0 else 1,
+            scoreBoost = if (city.isCapital) 50.0 else 8.0,
+            rank = city.rank,
+            isCapital = city.isCapital,
+        )
     }
 
     midpointCandidates(visibleCities, policy, camera).forEachIndexed { index, midpoint ->
@@ -1181,13 +1192,17 @@ private fun selectTemperatureLabels(
                 .thenByDescending { it.latitude }
                 .thenBy { it.longitude }
         )
+    val capitals = ranked.filter { it.isCapital }
 
     fun pick(distance: Double, targetCount: Int): List<LabelCandidate> {
-        val chosen = mutableListOf<LabelCandidate>()
+        val chosen = capitals.toMutableList()
         val d2 = distance * distance
         ranked.forEach { candidate ->
-            if (chosen.size >= targetCount || chosen.size >= policy.maxLabels) return@forEach
-            if (chosen.none { (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }) {
+            if (candidate.isCapital) return@forEach
+            val targetWithCapitals = max(targetCount, capitals.size)
+            val maxWithCapitals = max(policy.maxLabels, capitals.size)
+            if (chosen.size >= targetWithCapitals || chosen.size >= maxWithCapitals) return@forEach
+            if (chosen.none { !it.isCapital && (it.x - candidate.x) * (it.x - candidate.x) + (it.y - candidate.y) * (it.y - candidate.y) < d2 }) {
                 chosen += candidate
             }
         }
@@ -1201,12 +1216,15 @@ private fun selectTemperatureLabels(
 
     val chosen = pick(36.0, policy.minLabels).toMutableList()
     ranked.forEach { candidate ->
-        if (chosen.size >= policy.minLabels || chosen.size >= policy.maxLabels) return@forEach
+        if (candidate.isCapital) return@forEach
+        val maxWithCapitals = max(policy.maxLabels, capitals.size)
+        if (chosen.size >= policy.minLabels && chosen.size >= capitals.size) return@forEach
+        if (chosen.size >= maxWithCapitals) return@forEach
         if (chosen.none { geoDistanceScore(it.latitude, it.longitude, candidate.latitude, candidate.longitude) < 0.000001 }) {
             chosen += candidate
         }
     }
-    return chosen.take(policy.maxLabels)
+    return chosen
 }
 
 private data class MidpointCandidate(
@@ -1359,6 +1377,7 @@ private data class LabelCandidate(
     val y: Double,
     val priority: Int,
     val score: Double,
+    val isCapital: Boolean,
 )
 
 private fun MapLibreMap.cameraState(width: Int, height: Int): CameraState {
@@ -1515,7 +1534,7 @@ private val TEMP_COLOR_STOPS = listOf(
 )
 
 private val TEMP_CITY_ANCHORS = listOf(
-    TempCityAnchor("berlin", "Berlin", 52.5200, 13.4050, 10),
+    TempCityAnchor("berlin", "Berlin", 52.5200, 13.4050, 10, isCapital = true),
     TempCityAnchor("hamburg", "Hamburg", 53.5511, 9.9937, 20),
     TempCityAnchor("munich", "Muenchen", 48.1351, 11.5820, 30),
     TempCityAnchor("cologne", "Koeln", 50.9375, 6.9603, 40),
@@ -1528,46 +1547,61 @@ private val TEMP_CITY_ANCHORS = listOf(
     TempCityAnchor("hannover", "Hannover", 52.3759, 9.7320, 110),
     TempCityAnchor("bremen", "Bremen", 53.0793, 8.8017, 120),
     TempCityAnchor("nuremberg", "Nuernberg", 49.4521, 11.0767, 130),
-    TempCityAnchor("paris", "Paris", 48.8566, 2.3522, 10),
-    TempCityAnchor("london", "London", 51.5072, -0.1276, 10),
-    TempCityAnchor("madrid", "Madrid", 40.4168, -3.7038, 10),
-    TempCityAnchor("rome", "Rom", 41.9028, 12.4964, 10),
-    TempCityAnchor("vienna", "Wien", 48.2082, 16.3738, 20),
-    TempCityAnchor("prague", "Prag", 50.0755, 14.4378, 30),
-    TempCityAnchor("warsaw", "Warschau", 52.2297, 21.0122, 20),
-    TempCityAnchor("amsterdam", "Amsterdam", 52.3676, 4.9041, 30),
-    TempCityAnchor("brussels", "Bruessel", 50.8503, 4.3517, 40),
-    TempCityAnchor("copenhagen", "Kopenhagen", 55.6761, 12.5683, 40),
-    TempCityAnchor("stockholm", "Stockholm", 59.3293, 18.0686, 30),
-    TempCityAnchor("oslo", "Oslo", 59.9139, 10.7522, 40),
-    TempCityAnchor("helsinki", "Helsinki", 60.1699, 24.9384, 50),
+    TempCityAnchor("paris", "Paris", 48.8566, 2.3522, 10, isCapital = true),
+    TempCityAnchor("london", "London", 51.5072, -0.1276, 10, isCapital = true),
+    TempCityAnchor("madrid", "Madrid", 40.4168, -3.7038, 10, isCapital = true),
+    TempCityAnchor("rome", "Rom", 41.9028, 12.4964, 10, isCapital = true),
+    TempCityAnchor("vienna", "Wien", 48.2082, 16.3738, 20, isCapital = true),
+    TempCityAnchor("prague", "Prag", 50.0755, 14.4378, 30, isCapital = true),
+    TempCityAnchor("warsaw", "Warschau", 52.2297, 21.0122, 20, isCapital = true),
+    TempCityAnchor("amsterdam", "Amsterdam", 52.3676, 4.9041, 30, isCapital = true),
+    TempCityAnchor("brussels", "Bruessel", 50.8503, 4.3517, 40, isCapital = true),
+    TempCityAnchor("copenhagen", "Kopenhagen", 55.6761, 12.5683, 40, isCapital = true),
+    TempCityAnchor("stockholm", "Stockholm", 59.3293, 18.0686, 30, isCapital = true),
+    TempCityAnchor("oslo", "Oslo", 59.9139, 10.7522, 40, isCapital = true),
+    TempCityAnchor("helsinki", "Helsinki", 60.1699, 24.9384, 50, isCapital = true),
     TempCityAnchor("zurich", "Zuerich", 47.3769, 8.5417, 50),
-    TempCityAnchor("athens", "Athen", 37.9838, 23.7275, 30),
-    TempCityAnchor("lisbon", "Lissabon", 38.7223, -9.1393, 40),
-    TempCityAnchor("dublin", "Dublin", 53.3498, -6.2603, 50),
-    TempCityAnchor("budapest", "Budapest", 47.4979, 19.0402, 40),
+    TempCityAnchor("bern", "Bern", 46.9480, 7.4474, 45, isCapital = true),
+    TempCityAnchor("athens", "Athen", 37.9838, 23.7275, 30, isCapital = true),
+    TempCityAnchor("lisbon", "Lissabon", 38.7223, -9.1393, 40, isCapital = true),
+    TempCityAnchor("dublin", "Dublin", 53.3498, -6.2603, 50, isCapital = true),
+    TempCityAnchor("budapest", "Budapest", 47.4979, 19.0402, 40, isCapital = true),
     TempCityAnchor("istanbul", "Istanbul", 41.0082, 28.9784, 20),
-    TempCityAnchor("moscow", "Moskau", 55.7558, 37.6173, 20),
+    TempCityAnchor("ankara", "Ankara", 39.9334, 32.8597, 25, isCapital = true),
+    TempCityAnchor("moscow", "Moskau", 55.7558, 37.6173, 20, isCapital = true),
+    TempCityAnchor("washington-dc", "Washington", 38.9072, -77.0369, 15, isCapital = true),
     TempCityAnchor("new-york", "New York", 40.7128, -74.0060, 10),
     TempCityAnchor("los-angeles", "Los Angeles", 34.0522, -118.2437, 20),
     TempCityAnchor("chicago", "Chicago", 41.8781, -87.6298, 30),
+    TempCityAnchor("ottawa", "Ottawa", 45.4215, -75.6972, 25, isCapital = true),
     TempCityAnchor("toronto", "Toronto", 43.6532, -79.3832, 30),
-    TempCityAnchor("mexico-city", "Mexico City", 19.4326, -99.1332, 20),
+    TempCityAnchor("mexico-city", "Mexico City", 19.4326, -99.1332, 20, isCapital = true),
+    TempCityAnchor("brasilia", "Brasilia", -15.7939, -47.8828, 25, isCapital = true),
     TempCityAnchor("sao-paulo", "Sao Paulo", -23.5558, -46.6396, 10),
-    TempCityAnchor("buenos-aires", "Buenos Aires", -34.6037, -58.3816, 20),
-    TempCityAnchor("cairo", "Kairo", 30.0444, 31.2357, 20),
+    TempCityAnchor("buenos-aires", "Buenos Aires", -34.6037, -58.3816, 20, isCapital = true),
+    TempCityAnchor("santiago", "Santiago", -33.4489, -70.6693, 30, isCapital = true),
+    TempCityAnchor("lima", "Lima", -12.0464, -77.0428, 30, isCapital = true),
+    TempCityAnchor("bogota", "Bogota", 4.7110, -74.0721, 30, isCapital = true),
+    TempCityAnchor("cairo", "Kairo", 30.0444, 31.2357, 20, isCapital = true),
     TempCityAnchor("lagos", "Lagos", 6.5244, 3.3792, 30),
     TempCityAnchor("johannesburg", "Johannesburg", -26.2041, 28.0473, 40),
+    TempCityAnchor("pretoria", "Pretoria", -25.7479, 28.2293, 35, isCapital = true),
+    TempCityAnchor("nairobi", "Nairobi", -1.2921, 36.8219, 35, isCapital = true),
+    TempCityAnchor("riyadh", "Riyadh", 24.7136, 46.6753, 30, isCapital = true),
+    TempCityAnchor("abu-dhabi", "Abu Dhabi", 24.4539, 54.3773, 25, isCapital = true),
     TempCityAnchor("dubai", "Dubai", 25.2048, 55.2708, 30),
+    TempCityAnchor("tehran", "Tehran", 35.6892, 51.3890, 25, isCapital = true),
     TempCityAnchor("delhi", "Delhi", 28.6139, 77.2090, 10),
     TempCityAnchor("mumbai", "Mumbai", 19.0760, 72.8777, 20),
-    TempCityAnchor("beijing", "Beijing", 39.9042, 116.4074, 10),
+    TempCityAnchor("beijing", "Beijing", 39.9042, 116.4074, 10, isCapital = true),
     TempCityAnchor("shanghai", "Shanghai", 31.2304, 121.4737, 20),
-    TempCityAnchor("tokyo", "Tokyo", 35.6762, 139.6503, 10),
-    TempCityAnchor("seoul", "Seoul", 37.5665, 126.9780, 20),
-    TempCityAnchor("bangkok", "Bangkok", 13.7563, 100.5018, 30),
-    TempCityAnchor("singapore", "Singapore", 1.3521, 103.8198, 30),
-    TempCityAnchor("jakarta", "Jakarta", -6.2088, 106.8456, 20),
+    TempCityAnchor("tokyo", "Tokyo", 35.6762, 139.6503, 10, isCapital = true),
+    TempCityAnchor("seoul", "Seoul", 37.5665, 126.9780, 20, isCapital = true),
+    TempCityAnchor("bangkok", "Bangkok", 13.7563, 100.5018, 30, isCapital = true),
+    TempCityAnchor("singapore", "Singapore", 1.3521, 103.8198, 30, isCapital = true),
+    TempCityAnchor("jakarta", "Jakarta", -6.2088, 106.8456, 20, isCapital = true),
+    TempCityAnchor("canberra", "Canberra", -35.2809, 149.1300, 25, isCapital = true),
     TempCityAnchor("sydney", "Sydney", -33.8688, 151.2093, 20),
     TempCityAnchor("melbourne", "Melbourne", -37.8136, 144.9631, 30),
+    TempCityAnchor("wellington", "Wellington", -41.2865, 174.7762, 35, isCapital = true),
 )
