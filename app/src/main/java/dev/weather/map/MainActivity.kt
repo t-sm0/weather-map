@@ -903,7 +903,7 @@ private class WeatherRepository {
         inFlightForecasts[key] = mutableListOf(callback)
         executor.execute {
             runCatching {
-                val grid = buildGrid(bounds, quality.rows, quality.cols, camera.latitude, camera.longitude)
+                val grid = buildForecastSamplePoints(bounds, quality.rows, quality.cols, camera.latitude, camera.longitude)
                 val latitudes = grid.joinToString(",") { "%.4f".format(Locale.US, it.first) }
                 val longitudes = grid.joinToString(",") { "%.4f".format(Locale.US, it.second) }
                 val url = "https://api.open-meteo.com/v1/forecast" +
@@ -1076,8 +1076,14 @@ private fun forecastCacheKey(bounds: GeoBounds, hourOffset: Int, zoomBucket: Int
 
 private fun roundToBucket(value: Double, step: Double): Int = (value / step).roundToInt()
 
-private fun buildGrid(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon: Double): List<Pair<Double, Double>> {
+private fun buildForecastSamplePoints(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon: Double): List<Pair<Double, Double>> {
     val points = mutableListOf(lat to lon)
+    TEMP_CITY_ANCHORS
+        .asSequence()
+        .filter { bounds.contains(it.latitude, it.longitude) }
+        .sortedWith(compareByDescending<TempCityAnchor> { it.isCapital }.thenBy { it.rank }.thenBy { it.id })
+        .take(MAX_CITY_FORECAST_POINTS)
+        .forEach { city -> points += city.latitude to city.longitude }
     repeat(rows) { iy ->
         val latitude = bounds.north - (bounds.north - bounds.south) * (iy.toDouble() / (rows - 1))
         repeat(cols) { ix ->
@@ -1085,8 +1091,11 @@ private fun buildGrid(bounds: GeoBounds, rows: Int, cols: Int, lat: Double, lon:
             points += latitude to longitude
         }
     }
-    return points
+    return points.distinctBy { forecastPointKey(it.first, it.second) }
 }
+
+private fun forecastPointKey(latitude: Double, longitude: Double): String =
+    "${"%.4f".format(Locale.US, latitude)}:${"%.4f".format(Locale.US, longitude)}"
 
 private fun tempColor(temp: Double, minTemp: Double, maxTemp: Double): Int {
     val actualSpan = max(0.1, maxTemp - minTemp)
@@ -1366,6 +1375,11 @@ private fun geoDistanceScore(latA: Double, lonA: Double, latB: Double, lonB: Dou
     (latA - latB) * (latA - latB) + (lonA - lonB) * (lonA - lonB)
 
 private fun temperatureAt(latitude: Double, longitude: Double, snapshot: ForecastSnapshot): Double {
+    snapshot.points.firstOrNull {
+        abs(it.latitude - latitude) < FORECAST_POINT_MATCH_EPSILON &&
+            abs(it.longitude - longitude) < FORECAST_POINT_MATCH_EPSILON
+    }?.let { return it.temperature }
+
     val target = project(latitude, longitude, 0.0)
     var weightSum = 0.0
     var temp = 0.0
@@ -1542,6 +1556,8 @@ private const val TEMP_LABEL_LAYER = "temperature-label-layer"
 private const val TEMP_LAYER_OPACITY = 0.46f
 private const val TEMP_PIXEL_ALPHA = 155
 private const val MIN_VISIBLE_TEMP_SPAN_C = 6.0
+private const val MAX_CITY_FORECAST_POINTS = 90
+private const val FORECAST_POINT_MATCH_EPSILON = 0.00001
 
 private val TEMP_COLOR_STOPS = listOf(
     TempColorStop(-8.0, 37, 99, 235),
