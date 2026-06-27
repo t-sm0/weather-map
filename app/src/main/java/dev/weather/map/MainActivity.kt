@@ -32,7 +32,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -61,11 +60,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.DefaultLifecycleObserver
@@ -80,12 +77,28 @@ import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression.get
 import org.maplibre.android.style.layers.PropertyFactory.rasterOpacity
+import org.maplibre.android.style.layers.PropertyFactory.symbolSortKey
+import org.maplibre.android.style.layers.PropertyFactory.textAllowOverlap
+import org.maplibre.android.style.layers.PropertyFactory.textColor
+import org.maplibre.android.style.layers.PropertyFactory.textField
+import org.maplibre.android.style.layers.PropertyFactory.textHaloBlur
+import org.maplibre.android.style.layers.PropertyFactory.textHaloColor
+import org.maplibre.android.style.layers.PropertyFactory.textHaloWidth
+import org.maplibre.android.style.layers.PropertyFactory.textIgnorePlacement
+import org.maplibre.android.style.layers.PropertyFactory.textOpacity
+import org.maplibre.android.style.layers.PropertyFactory.textPadding
+import org.maplibre.android.style.layers.PropertyFactory.textSize
 import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.layers.SymbolLayer
+import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.ImageSource
 import org.maplibre.android.style.sources.RasterSource
 import org.maplibre.android.style.sources.TileSet
+import org.maplibre.geojson.Feature
+import org.maplibre.geojson.FeatureCollection
+import org.maplibre.geojson.Point
 import java.net.HttpURLConnection
 import java.net.URL
 import java.time.LocalDateTime
@@ -149,8 +162,6 @@ private data class TempLabel(
     val value: Int,
     val name: String? = null,
 )
-
-private data class ProjectedTempLabel(val label: TempLabel, val x: Double, val y: Double)
 
 private data class TempCityAnchor(
     val id: String,
@@ -293,7 +304,6 @@ private fun WeatherMapApp(
     var radarIndex by remember { mutableIntStateOf(0) }
     var status by remember { mutableStateOf("Lade Wetterdaten...") }
     var loadToken by remember { mutableIntStateOf(0) }
-    var projectedTempLabels by remember { mutableStateOf<List<ProjectedTempLabel>>(emptyList()) }
     var stableTempLabels by remember { mutableStateOf<List<TempLabel>>(emptyList()) }
     var stableLabelCamera by remember { mutableStateOf<CameraState?>(null) }
     var stableLabelSnapshot by remember { mutableStateOf<ForecastSnapshot?>(null) }
@@ -372,7 +382,6 @@ private fun WeatherMapApp(
                         liveCamera = it
                         renderCamera = it
                     },
-                    onProjectedTempLabels = { projectedTempLabels = it },
                 )
 
                 if (layer == WeatherLayer.Temp && forecastState.snapshot == null) {
@@ -381,12 +390,6 @@ private fun WeatherMapApp(
                             color = if (forecastState.error == null) Color(0x2214B8A6) else Color(0x22EF4444),
                             size = size,
                         )
-                    }
-                }
-
-                if (layer == WeatherLayer.Temp) projectedTempLabels.forEach { projected ->
-                    if (projected.x in -80.0..(liveCamera.width + 80.0) && projected.y in -80.0..(liveCamera.height + 80.0)) {
-                        TemperatureLabel(projected.label, projected.x, projected.y)
                     }
                 }
 
@@ -439,7 +442,6 @@ private fun NativeWeatherMap(
     tempLabels: List<TempLabel>,
     onCameraMove: (CameraState) -> Unit,
     onCameraIdle: (CameraState) -> Unit,
-    onProjectedTempLabels: (List<ProjectedTempLabel>) -> Unit,
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -448,16 +450,6 @@ private fun NativeWeatherMap(
     var handledRecenterNonce by remember { mutableIntStateOf(0) }
     var lastMoveEmitMs by remember { mutableStateOf(0L) }
     val currentTempLabels by rememberUpdatedState(tempLabels)
-    val currentOnProjectedTempLabels by rememberUpdatedState(onProjectedTempLabels)
-
-    fun emitProjectedLabels(map: MapLibreMap) {
-        currentOnProjectedTempLabels(
-            currentTempLabels.map { label ->
-                val screen = map.projection.toScreenLocation(LatLng(label.latitude, label.longitude))
-                ProjectedTempLabel(label, screen.x.toDouble(), screen.y.toDouble())
-            }
-        )
-    }
 
     AndroidView(
         modifier = Modifier.fillMaxSize(),
@@ -486,10 +478,10 @@ private fun NativeWeatherMap(
                         mapHolder.installWeatherLayers()
                         mapHolder.updateRadar(radarFrame, layer)
                         mapHolder.updateTemperature(forecastSnapshot, layer)
+                        mapHolder.updateTemperatureLabels(currentTempLabels, layer)
                     }
                     map.addOnCameraMoveListener {
                         val now = SystemClock.uptimeMillis()
-                        emitProjectedLabels(map)
                         if (now - lastMoveEmitMs >= 90L) {
                             lastMoveEmitMs = now
                             onCameraMove(map.cameraState(width, height))
@@ -497,13 +489,11 @@ private fun NativeWeatherMap(
                     }
                     map.addOnCameraIdleListener {
                         onCameraIdle(map.cameraState(width, height))
-                        emitProjectedLabels(map)
                     }
                     post {
                         val initial = map.cameraState(width, height)
                         onCameraMove(initial)
                         onCameraIdle(initial)
-                        emitProjectedLabels(map)
                     }
                 }
             }
@@ -511,7 +501,7 @@ private fun NativeWeatherMap(
         update = { mapView ->
             mapHolder.updateRadar(radarFrame, layer)
             mapHolder.updateTemperature(forecastSnapshot, layer)
-            mapHolder.map?.let { emitProjectedLabels(it) }
+            mapHolder.updateTemperatureLabels(currentTempLabels, layer)
             if (recenterNonce > 0 && recenterNonce != handledRecenterNonce) {
                 handledRecenterNonce = recenterNonce
                 mapHolder.map?.animateCamera(
@@ -546,8 +536,10 @@ private class MapHolder {
     var style: Style? = null
     private var radarSource: RasterSource? = null
     private var tempSource: ImageSource? = null
+    private var tempLabelSource: GeoJsonSource? = null
     private var lastRadarPath: String? = null
     private var lastTempSnapshot: ForecastSnapshot? = null
+    private var lastTempLabelKey: String? = null
 
     fun installWeatherLayers() {
         // Weather layers are installed lazily once data is available.
@@ -610,6 +602,48 @@ private class MapHolder {
         }
         style.getLayer(TEMP_LAYER)?.setProperties(
             rasterOpacity(if (layer == WeatherLayer.Temp) TEMP_LAYER_OPACITY else 0.0f)
+        )
+    }
+
+    fun updateTemperatureLabels(labels: List<TempLabel>, layer: WeatherLayer) {
+        val style = style ?: return
+        val visible = layer == WeatherLayer.Temp
+        val key = labels.joinToString("|") { "${it.id}:${it.value}:${"%.4f".format(Locale.US, it.latitude)}:${"%.4f".format(Locale.US, it.longitude)}" }
+        val collection = FeatureCollection.fromFeatures(
+            labels.map { label ->
+                Feature.fromGeometry(Point.fromLngLat(label.longitude, label.latitude)).apply {
+                    addStringProperty("label", "${label.value}°")
+                    addNumberProperty("sort", if (label.name != null) 0 else 1)
+                }
+            }
+        )
+        val existing = style.getSource(TEMP_LABEL_SOURCE) as? GeoJsonSource
+        if (existing == null) {
+            tempLabelSource = GeoJsonSource(TEMP_LABEL_SOURCE, collection)
+            style.addSource(tempLabelSource!!)
+            val labelLayer = SymbolLayer(TEMP_LABEL_LAYER, TEMP_LABEL_SOURCE).withProperties(
+                textField(get("label")),
+                textSize(14f),
+                textColor(AndroidColor.rgb(17, 24, 39)),
+                textHaloColor(AndroidColor.argb(238, 255, 255, 255)),
+                textHaloWidth(4.0f),
+                textHaloBlur(0.35f),
+                textPadding(2.0f),
+                textAllowOverlap(true),
+                textIgnorePlacement(true),
+                symbolSortKey(get("sort")),
+            )
+            style.addLayer(labelLayer)
+            lastTempLabelKey = key
+        } else {
+            tempLabelSource = existing
+            if (key != lastTempLabelKey) {
+                existing.setGeoJson(collection)
+                lastTempLabelKey = key
+            }
+        }
+        style.getLayer(TEMP_LABEL_LAYER)?.setProperties(
+            textOpacity(if (visible) 1.0f else 0.0f)
         )
     }
 }
@@ -714,25 +748,6 @@ private fun MapButton(text: String, enabled: Boolean = true, onClick: () -> Unit
         colors = ButtonDefaults.buttonColors(containerColor = Color(0xF7FFFFFF), contentColor = Color(0xFF111827)),
     ) {
         Text(text, fontWeight = FontWeight.Black, style = MaterialTheme.typography.titleMedium)
-    }
-}
-
-@Composable
-private fun TemperatureLabel(label: TempLabel, x: Double, y: Double) {
-    val density = LocalDensity.current
-    Box(
-        modifier = Modifier
-            .offset {
-                with(density) {
-                    IntOffset(x.roundToInt() - 18.dp.roundToPx(), y.roundToInt() - 14.dp.roundToPx())
-                }
-            }
-            .clip(RoundedCornerShape(999.dp))
-            .background(Color(0xEFFFFFFF))
-            .border(1.dp, Color(0x33111827), RoundedCornerShape(999.dp))
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-    ) {
-        Text("${label.value}°", color = Color(0xFF111827), fontWeight = FontWeight.Black, style = MaterialTheme.typography.labelMedium)
     }
 }
 
@@ -1519,6 +1534,8 @@ private const val RADAR_SOURCE = "radar-source"
 private const val RADAR_LAYER = "radar-layer"
 private const val TEMP_SOURCE = "temperature-source"
 private const val TEMP_LAYER = "temperature-layer"
+private const val TEMP_LABEL_SOURCE = "temperature-label-source"
+private const val TEMP_LABEL_LAYER = "temperature-label-layer"
 private const val TEMP_LAYER_OPACITY = 0.46f
 private const val TEMP_PIXEL_ALPHA = 155
 private const val MIN_VISIBLE_TEMP_SPAN_C = 6.0
